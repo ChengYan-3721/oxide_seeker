@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OxideSeeker — 以图搜文件</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <span class="logo-icon">🔍</span>
+      <span class="logo-text">OxideSeeker</span>
+      <span class="logo-sub">印前设计文件以图搜索</span>
+    </div>
+    <div class="header-right">
+      <div class="index-status" id="indexStatus">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">连接中…</span>
+      </div>
+      <button id="settingsBtn" class="icon-btn" hidden title="设置扫描目录">⚙️</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal" hidden>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>设置扫描目录</h3>
+          <button id="closeSettings" class="close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="hint">这些目录将被扫描以查找 PDF 和 AI 文件。目前仅支持本地服务器路径。</p>
+          <div id="dirList" class="dir-list">
+            <!-- Dirs will be injected here -->
+          </div>
+          <button id="addDirBtn" class="add-btn">+ 添加目录</button>
+        </div>
+        <div class="modal-footer">
+          <span id="saveStatus" class="save-status"></span>
+          <button id="saveSettings" class="save-btn">保存并应用</button>
+        </div>
+      </div>
+    </div>
+    <!-- Search area -->
+    <section class="search-section">
+      <div id="dropZone" class="drop-zone">
+        <div class="drop-content" id="dropContent">
+          <div class="drop-icon">📋</div>
+          <p class="drop-hint">拖放截图到此处，或 <strong>Ctrl+V 粘贴</strong>截图</p>
+          <p class="drop-hint-small">支持 PNG、JPEG、WebP 格式</p>
+          <label class="upload-btn">
+            <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp" hidden />
+            选择图片文件
+          </label>
+        </div>
+        <img id="previewImg" class="preview-img hidden" alt="查询图片预览" />
+        <button id="clearBtn" class="clear-btn hidden">✕ 清除</button>
+      </div>
+
+      <div class="search-controls">
+        <label>
+          返回结果数
+          <select id="topK">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+          </select>
+        </label>
+        <button id="searchBtn" class="search-btn" disabled>搜 索</button>
+        <!-- Inline non-blocking search indicator -->
+        <div class="loading-overlay" id="loadingOverlay" hidden>
+          <div class="spinner"></div>
+          <span>搜索中…</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Results area -->
+    <section class="results-section" id="resultsSection" hidden>
+      <div class="results-header">
+        <h2>搜索结果</h2>
+        <span class="results-meta" id="resultsMeta"></span>
+      </div>
+      <div class="results-grid" id="resultsGrid"></div>
+    </section>
+  </main>
+
+  <!-- Result card template -->
+  <template id="resultCardTpl">
+    <div class="result-card">
+      <div class="card-thumb-wrap">
+        <img class="card-thumb" alt="缩略图" loading="lazy" />
+        <span class="card-page-badge"></span>
+      </div>
+      <div class="card-info">
+        <p class="card-filename"></p>
+        <p class="card-path"></p>
+        <div class="card-meta">
+          <span class="card-similarity"></span>
+          <span class="card-size"></span>
+          <span class="card-pages"></span>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

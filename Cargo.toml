@@ -1,0 +1,76 @@
+[package]
+name = "oxide_seeker"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "oxide_seeker"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["multipart", "ws"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+
+# ONNX Runtime (CLIP inference)
+# Locked to an exact RC to avoid API drift during the 2.0 release-candidate series.
+ort = { version = "=2.0.0-rc.12", features = ["load-dynamic"] }
+ndarray = "0.15"
+
+# Image processing — `webp` feature enables both decoding and lossless encoding.
+image = { version = "0.25", features = ["jpeg", "png", "webp"] }
+image_hasher = "2.0"
+
+# PDF rendering
+pdfium-render = { version = "0.8", features = ["thread_safe"] }
+
+# Vector index (HNSW) — pure-Rust implementation with **true incremental insertion**.
+# Unlike `instant-distance`, hnsw_rs supports `insert` without graph rebuild,
+# so adds are O(log N) instead of O(N log N).
+hnsw_rs = "0.3"
+bincode = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono", "migrate"] }
+
+# File watching
+notify = { version = "6.1", features = ["serde"] }
+
+# Parallel processing
+rayon = "1.10"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+base64 = "0.22"
+hex = "0.4"
+bytes = "1"
+mime = "0.3"
+once_cell = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+num_cpus = "1"
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1 # 允许 LLVM 执行更好的优化。
+lto = true # 启用链接时优化。
+opt-level = "z" # 优先考虑小的二进制文件大小。如果您更喜欢速度，请使用 `3`。
+# panic = "abort" # 已禁用，以便在程序崩溃时获取堆栈跟踪信息。（小工具可以用这个，大项目不要用）
+strip = true # 确保移除调试符号。

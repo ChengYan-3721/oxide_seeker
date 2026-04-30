@@ -1,0 +1,21 @@
+[filter]
+
+[indexer]
+batch_size = 8
+render_dpi = 150.0
+watch_enabled = true
+worker_threads = 8
+
+[paths]
+data_dir = "C:/OxideSeeker/data"
+model_path = "C:/OxideSeeker/models/clip_visual.onnx"
+scan_dirs = []
+
+[search]
+default_top_k = 20
+phash_threshold = 12
+similarity_threshold = 0.65
+
+[server]
+host = "0.0.0.0"
+port = 7788
