@@ -26,9 +26,6 @@ pub enum AppError {
     #[error("ONNX runtime error: {0}")]
     Onnx(#[from] ort::Error),
 
-    #[error("CLIP model not loaded")]
-    ModelNotLoaded,
-
     // ── Vector index ─────────────────────────────────────────────────────────
     #[error("Vector index error: {0}")]
     VectorIndex(String),
@@ -50,13 +47,6 @@ pub enum AppError {
 
     #[error("Unsupported media type: {mime}")]
     UnsupportedMediaType { mime: String },
-
-    // ── File indexing ────────────────────────────────────────────────────────
-    #[error("File not found: {path}")]
-    FileNotFound { path: String },
-
-    #[error("File excluded (imposition/layout PDF): {path}")]
-    FileExcluded { path: String },
 
     // ── Generic ────────────────────────────────────────────────────────���─────
     #[error(transparent)]
@@ -86,13 +76,6 @@ impl IntoResponse for AppError {
             AppError::UnsupportedMediaType { mime } => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 format!("Unsupported media type: {}", mime),
-            ),
-            AppError::FileNotFound { path } => {
-                (StatusCode::NOT_FOUND, format!("File not found: {}", path))
-            }
-            AppError::ModelNotLoaded => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "CLIP model not yet loaded".to_string(),
             ),
             _ => {
                 tracing::error!(error = %self, "Internal server error");

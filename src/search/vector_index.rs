@@ -70,6 +70,7 @@ const EF_SEARCH: usize = 64;
 // ── File naming ──────────────────────────────────────────────────────────────
 
 const GRAPH_SUFFIX: &str = ".hnsw.graph";
+const DATA_SUFFIX: &str = ".hnsw.data";
 const META_SUFFIX: &str = ".meta.bin";
 
 /// Sidecar metadata persisted alongside the HNSW graph.
@@ -116,6 +117,7 @@ impl VectorIndex {
             .to_string();
 
         let graph_path = dir.join(format!("{}{}", basename, GRAPH_SUFFIX));
+        let data_path = dir.join(format!("{}{}", basename, DATA_SUFFIX));
         let meta_path = dir.join(format!("{}{}", basename, META_SUFFIX));
 
         let (hnsw, meta) = if graph_path.exists() {
@@ -127,22 +129,52 @@ impl VectorIndex {
             // a one-off at startup (a few KB).
             let io: &'static mut HnswIo =
                 Box::leak(Box::new(HnswIo::new(&dir, &basename)));
-            let hnsw: Hnsw<'static, f32, DistDot> = io
-                .load_hnsw::<f32, DistDot>()
-                .map_err(|e| {
-                    AppError::VectorIndex(format!("Failed to load HNSW graph: {}", e))
-                })?;
-            let meta: VectorMeta = std::fs::read(&meta_path)
-                .ok()
-                .and_then(|bytes| bincode::deserialize(&bytes).ok())
-                .unwrap_or_default();
-            tracing::info!(
-                "HNSW loaded: {} points, {} tombstones, next_id={}",
-                hnsw.get_nb_point(),
-                meta.deleted.len(),
-                meta.next_id,
-            );
-            (hnsw, meta)
+            match io.load_hnsw::<f32, DistDot>() {
+                Ok(hnsw) => {
+                    let meta: VectorMeta = std::fs::read(&meta_path)
+                        .ok()
+                        .and_then(|bytes| bincode::deserialize(&bytes).ok())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "HNSW loaded: {} points, {} tombstones, next_id={}",
+                        hnsw.get_nb_point(),
+                        meta.deleted.len(),
+                        meta.next_id,
+                    );
+                    (hnsw, meta)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load HNSW index ({}). Treating dump as corrupted and recreating: {}",
+                        e,
+                        graph_path.display()
+                    );
+
+                    for p in [&graph_path, &data_path, &meta_path] {
+                        if p.exists() {
+                            if let Err(remove_err) = std::fs::remove_file(p) {
+                                return Err(AppError::VectorIndex(format!(
+                                    "Failed to load HNSW graph: {}; also failed to delete corrupted file {}: {}",
+                                    e,
+                                    p.display(),
+                                    remove_err
+                                )));
+                            }
+                            tracing::warn!("Deleted corrupted index file: {}", p.display());
+                        }
+                    }
+
+                    tracing::info!("Creating fresh HNSW index at {}", dir.display());
+                    let hnsw = Hnsw::<f32, DistDot>::new(
+                        MAX_NB_CONNECTION,
+                        DEFAULT_CAPACITY,
+                        MAX_LAYER,
+                        EF_CONSTRUCTION,
+                        DistDot {},
+                    );
+                    (hnsw, VectorMeta { next_id: 1, deleted: vec![] })
+                }
+            }
         } else {
             tracing::info!("Creating fresh HNSW index at {}", dir.display());
             let hnsw = Hnsw::<f32, DistDot>::new(

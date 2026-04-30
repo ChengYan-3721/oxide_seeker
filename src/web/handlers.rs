@@ -35,11 +35,6 @@ pub struct AppState {
 
 // ── POST /api/search  (multipart) ─────────────────────────────────────────────
 
-#[derive(Deserialize)]
-pub struct SearchQuery {
-    pub top_k: Option<usize>,
-}
-
 /// Upload an image file and return the top-K most similar pages.
 pub async fn search_upload(
     State(state): State<AppState>,

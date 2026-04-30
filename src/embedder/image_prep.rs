@@ -52,9 +52,3 @@ pub fn preprocess_for_clip(img: &DynamicImage) -> Array4<f32> {
 
     tensor
 }
-
-/// Convenience: preprocess raw image bytes (PNG, JPEG, WebP, …).
-pub fn preprocess_bytes_for_clip(data: &[u8]) -> crate::error::Result<Array4<f32>> {
-    let img = image::load_from_memory(data).map_err(crate::error::AppError::Image)?;
-    Ok(preprocess_for_clip(&img))
-}

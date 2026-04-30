@@ -17,7 +17,6 @@ pub struct FileRecord {
     pub page_count: i64,
     pub is_excluded: i64,
     pub indexed_at: Option<i64>,
-    pub created_at: i64,
 }
 
 /// Page record from the `pages` table
@@ -26,23 +25,8 @@ pub struct PageRecord {
     pub id: i64,
     pub file_id: i64,
     pub page_num: i64,
-    pub phash: Option<String>,
     pub vector_id: Option<i64>,
     pub thumb_path: Option<String>,
-    pub width_px: Option<i64>,
-    pub height_px: Option<i64>,
-}
-
-/// Index task record
-#[derive(Debug, Clone, FromRow)]
-pub struct IndexTaskRecord {
-    pub id: i64,
-    pub file_id: Option<i64>,
-    pub status: String,
-    pub error_msg: Option<String>,
-    pub attempts: i64,
-    pub created_at: i64,
-    pub updated_at: i64,
 }
 
 /// Summary counts for the index status API
@@ -174,69 +158,6 @@ pub async fn get_all_file_paths(pool: &DbPool) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// Fetch a file record by its id.
-pub async fn get_file_by_id(pool: &DbPool, file_id: i64) -> Result<Option<FileRecord>> {
-    let rec = sqlx::query_as::<_, FileRecord>("SELECT * FROM files WHERE id = ?1")
-        .bind(file_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(rec)
-}
-
-/// Return files that need (re-)indexing.
-pub async fn get_unindexed_files(pool: &DbPool) -> Result<Vec<FileRecord>> {
-    let recs = sqlx::query_as::<_, FileRecord>(
-        r#"
-        SELECT * FROM files
-        WHERE is_excluded = 0
-          AND (indexed_at IS NULL OR indexed_at < modified_at)
-        ORDER BY created_at ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(recs)
-}
-
-// ── Page operations ───────────────────────────────────────────────────────────
-
-/// Insert or update a page record. Returns the page's `id`.
-pub async fn upsert_page(
-    pool: &DbPool,
-    file_id: i64,
-    page_num: i64,
-    phash: Option<&str>,
-    vector_id: Option<i64>,
-    thumb_path: Option<&str>,
-    width_px: Option<i64>,
-    height_px: Option<i64>,
-) -> Result<i64> {
-    let row = sqlx::query(
-        r#"
-        INSERT INTO pages (file_id, page_num, phash, vector_id, thumb_path, width_px, height_px)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ON CONFLICT(file_id, page_num) DO UPDATE SET
-            phash      = excluded.phash,
-            vector_id  = excluded.vector_id,
-            thumb_path = excluded.thumb_path,
-            width_px   = excluded.width_px,
-            height_px  = excluded.height_px
-        RETURNING id
-        "#,
-    )
-    .bind(file_id)
-    .bind(page_num)
-    .bind(phash)
-    .bind(vector_id)
-    .bind(thumb_path)
-    .bind(width_px)
-    .bind(height_px)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(row.get::<i64, _>("id"))
-}
-
 /// A single row to upsert into the `pages` table.  Used by
 /// [`upsert_pages_batch`] so the worker pool can persist every page of a
 /// freshly-indexed file in a single transaction (one fsync for N pages).
@@ -289,17 +210,6 @@ pub async fn upsert_pages_batch(
     Ok(())
 }
 
-/// Fetch all pages for a file.
-pub async fn get_pages_for_file(pool: &DbPool, file_id: i64) -> Result<Vec<PageRecord>> {
-    let recs = sqlx::query_as::<_, PageRecord>(
-        "SELECT * FROM pages WHERE file_id = ?1 ORDER BY page_num",
-    )
-    .bind(file_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(recs)
-}
-
 /// Fetch pages by a list of vector IDs.
 pub async fn get_pages_by_vector_ids(
     pool: &DbPool,
@@ -337,47 +247,6 @@ pub async fn find_pages_by_phash_candidates(pool: &DbPool) -> Result<Vec<(i64, S
             phash.map(|h| (id, h))
         })
         .collect())
-}
-
-// ── Index task operations ─────────────────────────────────────────────────────
-
-pub async fn enqueue_task(pool: &DbPool, file_id: i64) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO index_tasks (file_id, status) VALUES (?1, 'pending') ON CONFLICT DO NOTHING",
-    )
-    .bind(file_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn task_processing(pool: &DbPool, task_id: i64) -> Result<()> {
-    sqlx::query(
-        "UPDATE index_tasks SET status='processing', updated_at=unixepoch(), attempts=attempts+1 WHERE id=?1",
-    )
-    .bind(task_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn task_done(pool: &DbPool, task_id: i64) -> Result<()> {
-    sqlx::query("UPDATE index_tasks SET status='done', updated_at=unixepoch() WHERE id=?1")
-        .bind(task_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn task_failed(pool: &DbPool, task_id: i64, error: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE index_tasks SET status='failed', error_msg=?2, updated_at=unixepoch() WHERE id=?1",
-    )
-    .bind(task_id)
-    .bind(error)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 // ── Statistics ────────────────────────────────────────────────────────────────

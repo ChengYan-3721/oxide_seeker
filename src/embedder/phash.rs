@@ -7,9 +7,6 @@ use crate::error::{AppError, Result};
 use image::DynamicImage;
 use image_hasher::{HashAlg, HasherConfig, ImageHash};
 
-/// Number of bits in the pHash (64 bits = 8 bytes = 16 hex chars)
-pub const PHASH_BITS: u32 = 64;
-
 /// Compute the pHash of an image and return it as a 16-character hex string.
 pub fn compute_phash(img: &DynamicImage) -> String {
     let hasher = HasherConfig::new()
@@ -40,11 +37,6 @@ pub fn hamming_distance(a: &str, b: &str) -> Option<u32> {
     let ha = hex_to_hash(a).ok()?;
     let hb = hex_to_hash(b).ok()?;
     Some(ha.dist(&hb))
-}
-
-/// Return `true` if the Hamming distance between two hex hashes is within `threshold`.
-pub fn is_similar(a: &str, b: &str, threshold: u32) -> bool {
-    hamming_distance(a, b).map_or(false, |d| d <= threshold)
 }
 
 #[cfg(test)]

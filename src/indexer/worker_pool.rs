@@ -57,18 +57,6 @@ impl IndexProgress {
         })
     }
 
-    /// Returns `true` while the worker pool is still processing files.
-    pub fn is_running(&self) -> bool {
-        let total = self.total.load(Ordering::Relaxed);
-        if total == 0 {
-            return false;
-        }
-        let done = self.processed.load(Ordering::Relaxed)
-            + self.failed.load(Ordering::Relaxed)
-            + self.excluded.load(Ordering::Relaxed);
-        done < total
-    }
-
     /// Fraction of files processed (0.0 – 100.0).
     pub fn percent(&self) -> f64 {
         let total = self.total.load(Ordering::Relaxed);

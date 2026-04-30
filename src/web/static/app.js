@@ -185,7 +185,17 @@ function buildCard(r) {
   card.querySelector('.card-page-badge').textContent =
     r.page_count > 1 ? `第 ${r.page_num} 页` : '';
 
-  card.querySelector('.card-filename').textContent = r.filename;
+  const filenameEl = card.querySelector('.card-filename');
+  filenameEl.textContent = r.filename;
+  filenameEl.title = '点击复制文件名';
+  filenameEl.addEventListener('click', () => {
+    navigator.clipboard.writeText(r.filename).then(() => {
+      filenameEl.textContent = '✓ 已复制';
+      setTimeout(() => {
+        filenameEl.textContent = r.filename;
+      }, 1500);
+    });
+  });
 
   const pathEl = card.querySelector('.card-path');
   pathEl.textContent = r.file_path;
