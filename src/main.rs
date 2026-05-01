@@ -24,11 +24,25 @@ use crate::{
     },
 };
 use std::{path::PathBuf, sync::Arc};
+use single_instance::SingleInstance;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 检查程序是否已经在运行 (使用唯一的字符串标识)
+    let instance = SingleInstance::new("oxide_seeker_lock")?;
+    if !instance.is_single() {
+        return Ok(());
+    }
+
+    // 设置工作目录为 exe 所在目录 (解决相对路径问题，如找不到 config.toml)，否则开机启动会失败
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            let _ = std::env::set_current_dir(dir);
+        }
+    }
+
     // Logging
     tracing_subscriber::fmt()
         .with_timer(time::LocalTime::rfc_3339())
