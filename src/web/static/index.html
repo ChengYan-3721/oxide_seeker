@@ -18,6 +18,8 @@
         <span class="status-dot" id="statusDot"></span>
         <span id="statusText">连接中…</span>
       </div>
+      <span id="licenseHeaderHint" class="license-header-hint hidden"></span>
+      <button id="licenseBtn" class="icon-btn" title="许可管理">🔐</button>
       <button id="settingsBtn" class="icon-btn" hidden title="设置扫描目录">⚙️</button>
     </div>
   </header>
@@ -43,6 +45,32 @@
         </div>
       </div>
     </div>
+    <!-- License Modal -->
+    <div id="licenseModal" class="modal" hidden>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>许可管理</h3>
+          <button id="closeLicense" class="close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="license-status" id="licenseStatusBar">
+            <span class="license-label">当前状态：</span>
+            <span id="licenseStatusText">检测中…</span>
+          </div>
+          <p id="licenseMessage" class="license-message">加载中…</p>
+          <div class="machine-row">
+            <span class="machine-label">机器码：</span>
+            <code id="machineIdText" class="machine-id">加载中…</code>
+            <button id="copyMachineBtn" class="copy-machine-btn" type="button">复制</button>
+          </div>
+          <div class="license-form-row">
+            <input id="licenseInput" class="license-input" type="text" placeholder="输入许可字符串" />
+            <button id="licenseSaveBtn" class="license-save-btn">保存许可</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Search area -->
     <section class="search-section">
       <div id="dropZone" class="drop-zone">
@@ -75,6 +103,7 @@
           <span>搜索中…</span>
         </div>
       </div>
+
     </section>
 
     <!-- Results area -->

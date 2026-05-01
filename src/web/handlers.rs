@@ -1,11 +1,15 @@
 //! Axum HTTP request handlers.
 
 use crate::{
-    error::{AppError, Result},
-    indexer::{self, IndexProgress},
-    search::{SearchEngine, SearchResponse, vector_index::VectorIndex},
-    storage::{database::{self, DbPool}, thumbnail::ThumbnailStore},
-    embedder::clip::ClipEmbedder,
+   embedder::clip::ClipEmbedder,
+   error::{AppError, Result},
+   indexer::{self, IndexProgress},
+   license,
+   search::{vector_index::VectorIndex, SearchEngine, SearchResponse},
+   storage::{
+       database::{self, DbPool},
+       thumbnail::ThumbnailStore,
+   },
 };
 use axum::{
     body::Bytes,
@@ -37,9 +41,13 @@ pub struct AppState {
 
 /// Upload an image file and return the top-K most similar pages.
 pub async fn search_upload(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
+   State(state): State<AppState>,
+   mut multipart: Multipart,
 ) -> Result<Json<SearchResponseBody>> {
+   let lic = license::evaluate_and_persist(&state.pool).await?;
+   if !lic.search_allowed {
+       return Err(AppError::InvalidRequest(lic.message));
+   }
     let mut image_bytes: Option<Bytes> = None;
     let mut top_k: Option<usize> = None;
 
@@ -99,9 +107,13 @@ pub struct ClipboardRequest {
 
 /// Accept a base64-encoded image (clipboard paste) and search.
 pub async fn search_clipboard(
-    State(state): State<AppState>,
-    Json(req): Json<ClipboardRequest>,
+   State(state): State<AppState>,
+   Json(req): Json<ClipboardRequest>,
 ) -> Result<Json<SearchResponseBody>> {
+   let lic = license::evaluate_and_persist(&state.pool).await?;
+   if !lic.search_allowed {
+       return Err(AppError::InvalidRequest(lic.message));
+   }
     // Strip the data-URI prefix if present
     let raw = if let Some(pos) = req.image_base64.find(',') {
         &req.image_base64[pos + 1..]
@@ -258,6 +270,31 @@ pub async fn get_config(
         scan_dirs: config.paths.scan_dirs.into_iter().map(|p| p.to_string_lossy().to_string()).collect(),
         is_local,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateLicenseRequest {
+   pub license_key: String,
+}
+
+pub async fn get_license_status(
+   State(state): State<AppState>,
+) -> Result<Json<license::LicenseStatusResponse>> {
+   let status = license::current_status(&state.pool).await?;
+   Ok(Json(status))
+}
+
+pub async fn update_license(
+   State(state): State<AppState>,
+   Json(req): Json<UpdateLicenseRequest>,
+) -> Result<Json<license::LicenseStatusResponse>> {
+   let normalized = req.license_key.trim();
+   let state_val = if normalized.is_empty() {
+       license::clear_license_key_and_evaluate(&state.pool).await?
+   } else {
+       license::save_license_key_and_evaluate(&state.pool, normalized).await?
+   };
+   Ok(Json(license::to_response(&state_val)))
 }
 
 pub async fn update_config(

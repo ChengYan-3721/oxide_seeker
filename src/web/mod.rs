@@ -9,10 +9,13 @@ use crate::{
     search::{SearchEngine, vector_index::VectorIndex},
     storage::{database::DbPool, thumbnail::ThumbnailStore},
     embedder::clip::ClipEmbedder,
-    web::{
-        handlers::{AppState, get_config, index_status, search_clipboard, search_upload, update_config},
-        ws_handler::{WsState, ws_handler},
-    },
+   web::{
+       handlers::{
+           get_config, get_license_status, index_status, search_clipboard, search_upload,
+           update_config, update_license, AppState,
+       },
+       ws_handler::{ws_handler, WsState},
+   },
 };
 use axum::{
     extract::DefaultBodyLimit,
@@ -63,8 +66,9 @@ pub fn build_router(
         // API routes
         .route("/api/search", post(search_upload))
         .route("/api/search/clipboard", post(search_clipboard))
-        .route("/api/index/status", get(index_status))
-        .route("/api/config", get(get_config).post(update_config))
+       .route("/api/index/status", get(index_status))
+       .route("/api/config", get(get_config).post(update_config))
+       .route("/api/license", get(get_license_status).post(update_license))
         .with_state(app_state)
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         // WebSocket route (different state type)

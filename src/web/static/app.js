@@ -24,11 +24,23 @@ const addDirBtn = document.getElementById('addDirBtn');
 const saveSettings = document.getElementById('saveSettings');
 const saveStatus = document.getElementById('saveStatus');
 
+const licenseBtn = document.getElementById('licenseBtn');
+const licenseModal = document.getElementById('licenseModal');
+const closeLicense = document.getElementById('closeLicense');
+const licenseStatusText = document.getElementById('licenseStatusText');
+const licenseMessage = document.getElementById('licenseMessage');
+const licenseInput = document.getElementById('licenseInput');
+const licenseSaveBtn = document.getElementById('licenseSaveBtn');
+const machineIdText = document.getElementById('machineIdText');
+const copyMachineBtn = document.getElementById('copyMachineBtn');
+const licenseHeaderHint = document.getElementById('licenseHeaderHint');
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let selectedFile = null; // File | null
 let wsRetryTimer = null;
 let indexFinished = false; // Guard to prevent progress bar re-showing after finish
 let currentScanDirs = [];
+let licenseAllowsSearch = false;
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function formatBytes(bytes) {
@@ -44,18 +56,18 @@ function formatSimilarity(v) {
 
 // ── Image selection ───────────────────────────────────────────────────────────
 function setImage(file) {
-  if (!file || !file.type.startsWith('image/')) {
-    alert('请选择有效的图片文件（PNG、JPEG 或 WebP）');
-    return;
-  }
-  selectedFile = file;
-  const url = URL.createObjectURL(file);
-  previewImg.src = url;
-  previewImg.classList.remove('hidden');
-  dropContent.classList.add('hidden');
-  clearBtn.classList.remove('hidden');
-  dropZone.classList.add('has-image');
-  searchBtn.disabled = false;
+ if (!file || !file.type.startsWith('image/')) {
+   alert('请选择有效的图片文件（PNG、JPEG 或 WebP）');
+   return;
+ }
+ selectedFile = file;
+ const url = URL.createObjectURL(file);
+ previewImg.src = url;
+ previewImg.classList.remove('hidden');
+ dropContent.classList.add('hidden');
+ clearBtn.classList.remove('hidden');
+ dropZone.classList.add('has-image');
+ searchBtn.disabled = !licenseAllowsSearch;
 }
 
 function clearImage() {
@@ -119,8 +131,12 @@ document.addEventListener('paste', (e) => {
 searchBtn.addEventListener('click', runSearch);
 
 async function runSearch() {
-  if (!selectedFile) return;
-  const topK = parseInt(topKSelect.value, 10);
+ if (!selectedFile) return;
+ if (!licenseAllowsSearch) {
+   alert('当前许可状态不允许搜索，请先输入有效许可。');
+   return;
+ }
+ const topK = parseInt(topKSelect.value, 10);
 
   // Show inline loading indicator and disable button — page remains interactive
   loadingOverlay.hidden = false;
@@ -417,4 +433,117 @@ saveSettings.addEventListener('click', async () => {
   }
 });
 
+function formatLicenseStatusLabel(status, expiresAt) {
+  if (status === 'trial') return '试用';
+  if (status === 'permanent') return '永久';
+  if (status === 'valid') {
+    if (!expiresAt) return '有效';
+    const d = new Date(expiresAt);
+    if (Number.isNaN(d.getTime())) return '有效';
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `有效期至 ${yyyy}-${mm}-${dd}`;
+  }
+  return '失效';
+}
+
+function applyLicenseStatus(data) {
+  const status = data.status || 'invalid';
+  const label = formatLicenseStatusLabel(status, data.expires_at);
+  licenseStatusText.textContent = label;
+  licenseStatusText.classList.remove('trial', 'valid', 'expired');
+  if (status === 'trial') {
+    licenseStatusText.classList.add('trial');
+  } else if (status === 'valid' || status === 'permanent') {
+    licenseStatusText.classList.add('valid');
+  } else {
+    licenseStatusText.classList.add('expired');
+  }
+
+  if (status === 'trial') {
+    licenseHeaderHint.textContent = '试用中，请尽快激活许可';
+    licenseHeaderHint.classList.remove('hidden', 'expired');
+    licenseHeaderHint.classList.add('trial');
+  } else if (status === 'expired' || status === 'invalid') {
+    licenseHeaderHint.textContent = '试用已结束，请购买许可';
+    licenseHeaderHint.classList.remove('hidden', 'trial');
+    licenseHeaderHint.classList.add('expired');
+  } else {
+    licenseHeaderHint.textContent = '';
+    licenseHeaderHint.classList.add('hidden');
+    licenseHeaderHint.classList.remove('trial', 'expired');
+  }
+
+  licenseMessage.textContent = data.message || '';
+  machineIdText.textContent = data.machine_id || 'UNKNOWN-MACHINE-ID';
+  licenseAllowsSearch = !!data.search_allowed;
+  searchBtn.disabled = !(selectedFile && licenseAllowsSearch);
+}
+
+async function refreshLicenseStatus() {
+ try {
+   const resp = await fetch('/api/license');
+   if (!resp.ok) throw new Error(resp.statusText);
+   const data = await resp.json();
+   applyLicenseStatus(data);
+ } catch (e) {
+   licenseStatusText.textContent = '失效';
+   licenseStatusText.classList.remove('trial', 'valid');
+   licenseStatusText.classList.add('expired');
+   licenseHeaderHint.textContent = '许可状态异常，请检查后激活';
+   licenseHeaderHint.classList.remove('hidden', 'trial');
+   licenseHeaderHint.classList.add('expired');
+   licenseMessage.textContent = '许可状态获取失败: ' + e.message;
+   licenseAllowsSearch = false;
+   searchBtn.disabled = true;
+ }
+}
+
+copyMachineBtn.addEventListener('click', async () => {
+ const text = machineIdText.textContent || '';
+ if (!text) return;
+ try {
+   await navigator.clipboard.writeText(text);
+   const old = copyMachineBtn.textContent;
+   copyMachineBtn.textContent = '已复制';
+   setTimeout(() => {
+     copyMachineBtn.textContent = old || '复制';
+   }, 1200);
+ } catch (e) {
+   alert('复制失败：' + e.message);
+ }
+});
+
+licenseBtn.addEventListener('click', () => {
+  licenseModal.hidden = false;
+});
+
+closeLicense.addEventListener('click', () => {
+  licenseModal.hidden = true;
+});
+
+licenseSaveBtn.addEventListener('click', async () => {
+ const key = (licenseInput.value || '').trim();
+ licenseSaveBtn.disabled = true;
+ try {
+   const resp = await fetch('/api/license', {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ license_key: key }),
+   });
+   if (!resp.ok) {
+     const err = await resp.json().catch(() => ({ error: resp.statusText }));
+     throw new Error(err.error || resp.statusText);
+   }
+   const data = await resp.json();
+   applyLicenseStatus(data);
+ } catch (e) {
+   alert('许可保存失败：' + e.message);
+ } finally {
+   licenseSaveBtn.disabled = false;
+ }
+});
+
 initSettings();
+refreshLicenseStatus();

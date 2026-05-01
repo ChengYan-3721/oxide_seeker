@@ -6,6 +6,7 @@ use std::path::Path;
 pub type DbPool = SqlitePool;
 
 /// File record from the `files` table
+#[allow(dead_code)]
 #[derive(Debug, Clone, FromRow)]
 pub struct FileRecord {
     pub id: i64,
@@ -17,16 +18,21 @@ pub struct FileRecord {
     pub page_count: i64,
     pub is_excluded: i64,
     pub indexed_at: Option<i64>,
+    pub created_at: i64,
 }
 
 /// Page record from the `pages` table
+#[allow(dead_code)]
 #[derive(Debug, Clone, FromRow)]
 pub struct PageRecord {
     pub id: i64,
     pub file_id: i64,
     pub page_num: i64,
+    pub phash: Option<String>,
     pub vector_id: Option<i64>,
     pub thumb_path: Option<String>,
+    pub width_px: Option<i64>,
+    pub height_px: Option<i64>,
 }
 
 /// Summary counts for the index status API
@@ -37,6 +43,21 @@ pub struct IndexStats {
     pub excluded_files: i64,
     pub failed_files: i64,
     pub total_pages: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, FromRow)]
+pub struct LicenseRow {
+    pub id: i64,
+    pub install_fingerprint: String,
+    pub install_started_at: i64,
+    pub license_key: Option<String>,
+    pub last_status: String,
+    pub last_message: Option<String>,
+    pub expires_at: Option<i64>,
+    pub customer: Option<String>,
+    pub validated_at: Option<i64>,
+    pub updated_at: i64,
 }
 
 /// Initialise the connection pool and run embedded migrations.
@@ -53,12 +74,16 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool> {
         .map_err(AppError::Database)?;
 
     // Run SQL migrations from the `migrations/` directory
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .map_err(AppError::Migration)?;
+   sqlx::migrate!("./migrations")
+       .run(&pool)
+       .await
+       .map_err(AppError::Migration)?;
 
-    sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
+   // Post-migration bootstrap for schema additions that were introduced after
+   // initial deployment but must work for both old and new databases.
+   ensure_license_schema(&pool).await?;
+
+   sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
     sqlx::query("PRAGMA synchronous=NORMAL").execute(&pool).await?;
     sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
 
@@ -250,6 +275,132 @@ pub async fn find_pages_by_phash_candidates(pool: &DbPool) -> Result<Vec<(i64, S
 }
 
 // ── Statistics ────────────────────────────────────────────────────────────────
+
+async fn ensure_license_schema(pool: &DbPool) -> Result<()> {
+   sqlx::query(
+       r#"
+       CREATE TABLE IF NOT EXISTS app_license (
+           id                  INTEGER PRIMARY KEY CHECK (id = 1),
+           install_fingerprint TEXT    NOT NULL,
+           install_started_at  INTEGER NOT NULL,
+           license_key         TEXT,
+           last_status         TEXT    NOT NULL DEFAULT 'trial',
+           last_message        TEXT,
+           expires_at          INTEGER,
+           customer            TEXT,
+           validated_at        INTEGER,
+           updated_at          INTEGER NOT NULL DEFAULT (unixepoch())
+       )
+       "#,
+   )
+   .execute(pool)
+   .await?;
+
+   sqlx::query(
+       r#"
+       INSERT OR IGNORE INTO app_license (id, install_fingerprint, install_started_at, last_status, updated_at)
+       VALUES (1, '', 0, 'trial', unixepoch())
+       "#,
+   )
+   .execute(pool)
+   .await?;
+
+   Ok(())
+}
+
+pub async fn get_or_init_license_row(
+   pool: &DbPool,
+   install_fingerprint: &str,
+) -> Result<LicenseRow> {
+   let now = chrono::Utc::now().timestamp();
+   sqlx::query(
+       r#"
+       INSERT INTO app_license (id, install_fingerprint, install_started_at, last_status, updated_at)
+       VALUES (1, ?1, ?2, 'trial', ?2)
+       ON CONFLICT(id) DO NOTHING
+       "#,
+   )
+   .bind(install_fingerprint)
+   .bind(now)
+   .execute(pool)
+   .await?;
+
+   sqlx::query(
+       r#"
+       UPDATE app_license
+       SET install_fingerprint = ?1
+       WHERE id = 1 AND (install_fingerprint = '' OR install_fingerprint IS NULL)
+       "#,
+   )
+   .bind(install_fingerprint)
+   .execute(pool)
+   .await?;
+
+   // Backfill install_started_at for rows bootstrapped with 0 in ensure_license_schema().
+   // This guarantees trial start time is initialized correctly on first runtime.
+   sqlx::query(
+       r#"
+       UPDATE app_license
+       SET install_started_at = ?1,
+           updated_at = ?1
+       WHERE id = 1 AND install_started_at <= 0
+       "#,
+   )
+   .bind(now)
+   .execute(pool)
+   .await?;
+
+   let row = sqlx::query_as::<_, LicenseRow>("SELECT * FROM app_license WHERE id = 1")
+       .fetch_one(pool)
+       .await?;
+
+   Ok(row)
+}
+
+pub async fn update_license_state(
+   pool: &DbPool,
+   status: &str,
+   message: Option<&str>,
+   expires_at: Option<i64>,
+   customer: Option<&str>,
+   validated_at: Option<i64>,
+) -> Result<()> {
+   sqlx::query(
+       r#"
+       UPDATE app_license
+       SET last_status = ?1,
+           last_message = ?2,
+           expires_at = ?3,
+           customer = ?4,
+           validated_at = ?5,
+           updated_at = unixepoch()
+       WHERE id = 1
+       "#,
+   )
+   .bind(status)
+   .bind(message)
+   .bind(expires_at)
+   .bind(customer)
+   .bind(validated_at)
+   .execute(pool)
+   .await?;
+   Ok(())
+}
+
+pub async fn update_license_key(pool: &DbPool, license_key: Option<&str>) -> Result<()> {
+   sqlx::query(
+       r#"
+       UPDATE app_license
+       SET license_key = ?1,
+           updated_at = unixepoch()
+       WHERE id = 1
+       "#,
+   )
+   .bind(license_key)
+   .execute(pool)
+   .await?;
+   Ok(())
+}
 
 pub async fn get_index_stats(pool: &DbPool) -> Result<IndexStats> {
     let row = sqlx::query(

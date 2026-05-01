@@ -11,6 +11,7 @@ mod error;
 mod indexer;
 mod search;
 mod storage;
+mod license;
 mod web;
 
 use crate::{
@@ -53,6 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let thumb_store = Arc::new(
         ThumbnailStore::new(&config.thumbnails_dir()).await?,
     );
+
+    // License state init
+    let license_state = license::evaluate_and_persist(&pool).await?;
+    tracing::info!("License status: {} - {}", license_state.status, license_state.message);
 
     // Vector index
     let vector_index = VectorIndex::open(&config.vector_index_path())?;
