@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use std::{
     error::Error,
     path::PathBuf,
@@ -21,8 +22,17 @@ use windows_service::{
     service_dispatcher,
 };
 
+#[path = "job_object.rs"]
+mod job_object;
+
 define_windows_service!(ffi_service_main, my_service_main);
 const SERVICE_NAME: &str = "OxideSeeker";
+/// Mirrors `oxide_seeker::SERVICE_MODE_FLAG`.  Kept as a literal here so the
+/// service binary doesn't need to depend on the main crate as a library.
+const SERVICE_MODE_FLAG: &str = "--service-mode";
+/// Time we give the main process to drain in-flight DB writes after we close
+/// its stdin (graceful-shutdown signal) before we fall back to TerminateProcess.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 fn main() {
@@ -114,6 +124,14 @@ pub fn run_service() -> Result<(), Box<dyn Error>> {
     let mut child: Option<Child> = None;
     let target_exe = get_target_exe_path()?;
 
+    // Outer Job Object: wraps oxide_seeker.exe.  If this service process is
+    // killed (Stop, crash, end-task), the kernel closes the Job handle and
+    // every member — main process plus its workers, since nested Jobs
+    // propagate — is terminated.  Belt-and-braces with the inner Job the
+    // main process maintains over its own workers.
+    let job = job_object::JobObject::new_kill_on_close()
+        .map_err(|e| format!("创建 Job Object 失败: {}", e))?;
+
     while RUNNING.load(Ordering::Relaxed) {
         let need_start = match child.as_mut() {
             Some(process) => process.try_wait()?.is_some(),
@@ -121,7 +139,7 @@ pub fn run_service() -> Result<(), Box<dyn Error>> {
         };
 
         if need_start {
-            child = Some(start_oxide_seeker(&target_exe)?);
+            child = Some(start_oxide_seeker(&target_exe, &job)?);
         }
 
         thread::sleep(Duration::from_millis(100));
@@ -142,27 +160,61 @@ fn get_target_exe_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(dir.join("oxide_seeker.exe"))
 }
 
-fn start_oxide_seeker(exe_path: &PathBuf) -> Result<Child, Box<dyn Error>> {
+fn start_oxide_seeker(
+    exe_path: &PathBuf,
+    job: &job_object::JobObject,
+) -> Result<Child, Box<dyn Error>> {
     if !exe_path.exists() {
         return Err(format!("目标程序不存在: {}", exe_path.display()).into());
     }
 
+    // stdin is piped so we can close it as a graceful-shutdown signal in
+    // stop_oxide_seeker.  stdout / stderr stay null — the main process
+    // writes its own logs.
     let child = Command::new(exe_path)
-        .stdin(Stdio::null())
+        .arg(SERVICE_MODE_FLAG)
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+
+    // Assign immediately so even if the main process crashes during early
+    // init (before it builds its own worker Job) the service Job still
+    // owns it.  Failure here means we'd lose cascading shutdown, so we
+    // tear the half-spawned child down rather than continue blindly.
+    if let Err(e) = job.assign_child(&child) {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("将 oxide_seeker.exe 加入 Job Object 失败: {}", e).into());
+    }
 
     Ok(child)
 }
 
 fn stop_oxide_seeker(child: &mut Child) -> Result<(), Box<dyn Error>> {
-    match child.try_wait()? {
-        Some(_) => Ok(()),
-        None => {
-            child.kill()?;
-            let _ = child.wait();
-            Ok(())
-        }
+    if child.try_wait()?.is_some() {
+        return Ok(());
     }
+
+    // 1. Graceful: drop stdin so the main process's stdin watchdog observes
+    //    EOF and exits cleanly (its own Job kills the workers on the way
+    //    out).
+    drop(child.stdin.take());
+
+    // 2. Wait briefly for the child to honour the signal.
+    let deadline = Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // 3. Hard kill as a fallback.  The outer Job Object will also tear
+    //    down any workers that managed to escape the inner Job, so this
+    //    is just to make the wait below return promptly.
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
 }

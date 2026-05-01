@@ -316,16 +316,16 @@ graph LR
 
 ```mermaid
 graph TD
-    A[文件扫描器\nwalkdir] --> B{是否已索引\n且未修改?}
+    A[文件扫描器walkdir] --> B{是否已索引且未修改?}
     B -->|是| C[跳过]
     B -->|否| F[XMP 拼版过滤器]
     F -->|命中| G[标记 is_excluded=1]
     F -->|通过| D[PDFium 渲染全部页]
-    D --> H[保存缩略图\n256px WebP]
+    D --> H[保存缩略图256px WebP]
     D --> I[批量计算 pHash]
-    D --> J[批量 CLIP 推理\n一次 forward 处理整个文件的所有页]
-    J --> K[批量 add_batch\n到 hnsw_rs HNSW]
-    K --> L[单事务批量 UPSERT pages\n(一个文件一个 fsync)]
+    D --> J[批量 CLIP 推理一次 forward 处理整个文件的所有页]
+    J --> K[批量 add_batch到 hnsw_rs HNSW]
+    K --> L[单事务批量 UPSERT pages一个文件一个 fsync]
     L --> M[mark_file_indexed]
 ```
 

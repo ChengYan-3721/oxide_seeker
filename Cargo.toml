@@ -78,7 +78,7 @@ single-instance = "0.3.3"
 windows-service = "0.8.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_JobObjects", "Win32_Security", "Win32_Foundation"] }
 
 [build-dependencies]
 winres = "0.1.12"

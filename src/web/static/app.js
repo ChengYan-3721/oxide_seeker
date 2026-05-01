@@ -54,6 +54,34 @@ function formatSimilarity(v) {
   return (v * 100).toFixed(1) + '%';
 }
 
+// 兼容非安全上下文（HTTP 局域网）：navigator.clipboard 仅在 https/localhost 可用
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    try {
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (ok) resolve();
+      else reject(new Error('execCommand copy 返回 false'));
+    } catch (e) {
+      document.body.removeChild(ta);
+      reject(e);
+    }
+  });
+}
+
 // ── Image selection ───────────────────────────────────────────────────────────
 function setImage(file) {
  if (!file || !file.type.startsWith('image/')) {
@@ -205,11 +233,13 @@ function buildCard(r) {
   filenameEl.textContent = r.filename;
   filenameEl.title = '点击复制文件名';
   filenameEl.addEventListener('click', () => {
-    navigator.clipboard.writeText(r.filename).then(() => {
+    copyText(r.filename).then(() => {
       filenameEl.textContent = '✓ 已复制';
       setTimeout(() => {
         filenameEl.textContent = r.filename;
       }, 1500);
+    }).catch((e) => {
+      alert('复制失败：' + e.message);
     });
   });
 
@@ -217,11 +247,13 @@ function buildCard(r) {
   pathEl.textContent = r.file_path;
   pathEl.title = '点击复制路径';
   pathEl.addEventListener('click', () => {
-    navigator.clipboard.writeText(r.file_path).then(() => {
+    copyText(r.file_path).then(() => {
       pathEl.textContent = '✓ 已复制';
       setTimeout(() => {
         pathEl.textContent = r.file_path;
       }, 1500);
+    }).catch((e) => {
+      alert('复制失败：' + e.message);
     });
   });
 
@@ -504,7 +536,7 @@ copyMachineBtn.addEventListener('click', async () => {
  const text = machineIdText.textContent || '';
  if (!text) return;
  try {
-   await navigator.clipboard.writeText(text);
+   await copyText(text);
    const old = copyMachineBtn.textContent;
    copyMachineBtn.textContent = '已复制';
    setTimeout(() => {

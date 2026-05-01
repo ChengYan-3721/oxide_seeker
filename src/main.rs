@@ -10,6 +10,8 @@ mod crash_handler;
 mod embedder;
 mod error;
 mod indexer;
+#[cfg(windows)]
+mod job_object;
 mod search;
 mod storage;
 mod license;
@@ -37,6 +39,21 @@ use tracing_subscriber::Layer;
 /// subprocess.  Detected before the tokio runtime / single-instance check so
 /// children don't fight the parent for the global lock.
 pub const WORKER_MODE_FLAG: &str = "--worker-mode";
+
+/// CLI flag passed by `oxide_seeker_service.exe` when it spawns this binary.
+/// Enables the stdin watchdog: when the service drops the child's stdin
+/// pipe, the watchdog triggers `process::exit(0)` so the Job Object cleans
+/// up the worker subprocesses.
+pub const SERVICE_MODE_FLAG: &str = "--service-mode";
+
+/// Global Job Object that owns every `--worker-mode` subprocess spawned by
+/// this main process.  When the main process exits for any reason (clean
+/// shutdown, panic, SEH crash, `TerminateProcess` from the service wrapper),
+/// the kernel closes this handle and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// terminates every worker synchronously.  No orphan workers can survive.
+#[cfg(windows)]
+pub static WORKER_JOB: once_cell::sync::OnceCell<job_object::JobObject> =
+    once_cell::sync::OnceCell::new();
 
 fn main() -> anyhow::Result<()> {
     // Re-execute paths first: if we were spawned as a worker subprocess, run
@@ -115,6 +132,45 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Crash recording: panic hook + Windows SEH filter writing to crash.log.
     crash_handler::install(log_dir, "parent");
+
+    // Worker process containment: create the parent's Job Object as early as
+    // possible so every subsequent worker spawn can join it.  Workers added
+    // here die automatically when this process exits — no orphans regardless
+    // of how the death happened.
+    #[cfg(windows)]
+    match job_object::JobObject::new_kill_on_close() {
+        Ok(job) => {
+            let _ = WORKER_JOB.set(job);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create worker Job Object ({}). Workers may outlive parent on crash.",
+                e
+            );
+        }
+    }
+
+    // When launched by the Windows service wrapper, watch stdin for EOF.
+    // The service's `stop_oxide_seeker` drops the child stdin pipe to
+    // request a graceful shutdown; here we just exit, which tears down
+    // workers via the Job Object above.
+    if std::env::args().any(|a| a == SERVICE_MODE_FLAG) {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut buf = [0u8; 64];
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            loop {
+                match handle.read(&mut buf) {
+                    Ok(0) => break,
+                    Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+            tracing::info!("Service shutdown signal received (parent stdin closed); exiting");
+            std::process::exit(0);
+        });
+    }
 
     // Config
     let config_path = parse_config_arg();

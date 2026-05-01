@@ -149,6 +149,23 @@ impl WorkerProcess {
                 ))
             })?;
 
+        // Tie the worker's lifetime to the parent's Job Object.  If the
+        // parent dies before reaching its own Drop / kill code path (panic,
+        // SEH crash, kill from the service wrapper), the kernel closes the
+        // Job handle and the worker is terminated synchronously.  Done
+        // before the Init frame so a concurrent parent-death window can't
+        // leave a worker mid-handshake without Job protection.
+        #[cfg(windows)]
+        if let Some(job) = crate::WORKER_JOB.get() {
+            if let Err(e) = job.assign_child(&child) {
+                tracing::warn!(
+                    "[worker {}] Failed to assign worker to Job Object: {}. Worker may outlive parent on crash.",
+                    worker_idx,
+                    e
+                );
+            }
+        }
+
         let stdin = child.stdin.take().ok_or_else(|| {
             AppError::Other(anyhow::anyhow!("worker stdin was not piped"))
         })?;
