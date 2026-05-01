@@ -26,6 +26,7 @@ const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 // ── Shared handler state ──────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppState {
     pub engine: SearchEngine,
@@ -362,18 +363,14 @@ pub async fn update_config(
     state.progress.finished.store(false, std::sync::atomic::Ordering::Release);
 
     let pool = state.pool.clone();
-    let clip = state.clip.clone();
     let vector_index = state.vector_index.clone();
-    let thumb_store = state.thumb_store.clone();
     let progress = state.progress.clone();
 
     tokio::spawn(async move {
         if let Err(e) = indexer::start_full_index(
             config_arc,
             pool,
-            clip,
             vector_index,
-            thumb_store,
             progress,
         ).await {
             tracing::error!("Failed to trigger re-index after config update: {}", e);

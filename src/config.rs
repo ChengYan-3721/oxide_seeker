@@ -40,6 +40,34 @@ pub struct IndexerConfig {
     pub watch_enabled: bool,
     /// DPI for PDF page rendering (higher = better quality, slower)
     pub render_dpi: f32,
+    /// Maximum directory recursion depth, counted from each `paths.scan_dirs`
+    /// entry (the entry itself is depth 0, its children depth 1, etc.).  Files
+    /// deeper than this are ignored.  Hard-capped at
+    /// [`MAX_SCAN_DEPTH_LIMIT`]; values above the cap are silently clamped to
+    /// avoid runaway recursion on pathological hierarchies (e.g. `node_modules`).
+    #[serde(default = "IndexerConfig::default_max_scan_depth")]
+    pub max_scan_depth: u32,
+}
+
+/// Hard cap for `IndexerConfig::max_scan_depth`.  Picked at 32 because:
+///   * Windows MAX_PATH (~260) divided by a typical 8-char folder name puts
+///     a sane upper bound around 32 levels;
+///   * scanning beyond 32 levels almost always indicates a symlink loop or
+///     content-addressable storage that should be excluded explicitly, not
+///     traversed.
+pub const MAX_SCAN_DEPTH_LIMIT: u32 = 32;
+
+impl IndexerConfig {
+    fn default_max_scan_depth() -> u32 {
+        3
+    }
+
+    /// Return the configured depth, clamped to [`MAX_SCAN_DEPTH_LIMIT`].
+    /// A depth of `0` means "scan the root directory only", so we keep the
+    /// raw value as-is at the lower bound.
+    pub fn effective_max_scan_depth(&self) -> u32 {
+        self.max_scan_depth.min(MAX_SCAN_DEPTH_LIMIT)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -127,6 +155,7 @@ impl Default for Config {
                 batch_size: 8,
                 watch_enabled: true,
                 render_dpi: 150.0,
+                max_scan_depth: IndexerConfig::default_max_scan_depth(),
             },
             search: SearchConfig {
                 default_top_k: 20,

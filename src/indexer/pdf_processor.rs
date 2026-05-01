@@ -27,6 +27,7 @@ pub struct RenderedPage {
 }
 
 /// Summary returned after processing an entire file.
+#[allow(dead_code)]
 pub struct ProcessedFile {
     pub pages: Vec<RenderedPage>,
     /// `true` if the file was excluded by the imposition filter

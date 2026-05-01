@@ -281,12 +281,74 @@ impl VectorIndex {
     /// Uses hnsw_rs's read-lock-only dump path, so it is safe to call
     /// concurrently with `add` / `search` — inserts just briefly wait on the
     /// internal RwLock.
+    ///
+    /// Workaround for hnsw_rs 0.3.4: `HnswIo::load_hnsw` unconditionally sets
+    /// the internal `datamap_opt` flag to `true`, which makes `file_dump` pick
+    /// the "do not overwrite" code path on every subsequent save and emit
+    /// uniquely-suffixed files like `vectors-NNNN.hnsw.{graph,data}` instead of
+    /// updating the canonical ones.  We dump to a temp basename and rename on
+    /// success so the canonical pair always reflects the latest state.
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir).map_err(AppError::Io)?;
-        self.hnsw
-            .file_dump(&self.dir, &self.basename)
+
+        // hnsw_rs panics / errors when dumping an HNSW with no entry point.
+        // Persist meta only so `next_id` survives restarts in this case.
+        if self.hnsw.get_nb_point() == 0 {
+            self.write_meta()?;
+            return Ok(());
+        }
+
+        let tmp_basename = format!("{}.new", self.basename);
+        let tmp_graph = self.dir.join(format!("{}{}", tmp_basename, GRAPH_SUFFIX));
+        let tmp_data = self.dir.join(format!("{}{}", tmp_basename, DATA_SUFFIX));
+        // Clean leftovers from a previous failed save so DumpInit doesn't
+        // generate yet another random-suffixed filename.
+        let _ = std::fs::remove_file(&tmp_graph);
+        let _ = std::fs::remove_file(&tmp_data);
+
+        let actual_basename = self
+            .hnsw
+            .file_dump(&self.dir, &tmp_basename)
             .map_err(|e| AppError::VectorIndex(format!("file_dump failed: {}", e)))?;
 
+        if actual_basename != tmp_basename {
+            // hnsw_rs still picked a unique suffix despite our fresh tmp name
+            // (e.g. a concurrent save raced with us). Clean up and bail.
+            let stray_graph = self.dir.join(format!("{}{}", actual_basename, GRAPH_SUFFIX));
+            let stray_data = self.dir.join(format!("{}{}", actual_basename, DATA_SUFFIX));
+            let _ = std::fs::remove_file(&stray_graph);
+            let _ = std::fs::remove_file(&stray_data);
+            return Err(AppError::VectorIndex(format!(
+                "file_dump generated unexpected basename: {}",
+                actual_basename
+            )));
+        }
+
+        let final_graph = self.dir.join(format!("{}{}", self.basename, GRAPH_SUFFIX));
+        let final_data = self.dir.join(format!("{}{}", self.basename, DATA_SUFFIX));
+
+        // std::fs::rename on Windows fails if the destination exists, so
+        // remove first then rename.
+        if final_graph.exists() {
+            std::fs::remove_file(&final_graph).map_err(AppError::Io)?;
+        }
+        if final_data.exists() {
+            std::fs::remove_file(&final_data).map_err(AppError::Io)?;
+        }
+        std::fs::rename(&tmp_graph, &final_graph).map_err(AppError::Io)?;
+        std::fs::rename(&tmp_data, &final_data).map_err(AppError::Io)?;
+
+        self.write_meta()?;
+
+        tracing::debug!(
+            "Vector index saved ({} points, {} tombstones)",
+            self.hnsw.get_nb_point(),
+            self.deleted.read().len(),
+        );
+        Ok(())
+    }
+
+    fn write_meta(&self) -> Result<()> {
         let meta = VectorMeta {
             next_id: self.next_id.load(Ordering::Acquire),
             deleted: self.deleted.read().iter().copied().collect(),
@@ -295,12 +357,6 @@ impl VectorIndex {
             .map_err(|e| AppError::VectorIndex(format!("meta serialise: {}", e)))?;
         let meta_path = self.dir.join(format!("{}{}", self.basename, META_SUFFIX));
         std::fs::write(&meta_path, bytes).map_err(AppError::Io)?;
-
-        tracing::debug!(
-            "Vector index saved ({} points, {} tombstones)",
-            self.hnsw.get_nb_point(),
-            self.deleted.read().len(),
-        );
         Ok(())
     }
 

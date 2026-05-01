@@ -1,36 +1,37 @@
-//! Concurrent indexing worker pool.
+//! Concurrent indexing worker pool — out-of-process variant.
 //!
 //! Architecture
 //! ------------
 //! * A `crossbeam-channel` bounded queue is fed by the scanner.
-//! * A fixed-size rayon thread pool drains the queue.  Each worker:
-//!   1. Creates its own **dedicated `ClipSession`** — no `Mutex`, no
-//!      contention across threads.
-//!   2. Opens a PDFium handle (PDFium is `!Send`, one per thread).
-//!   3. For each file:
-//!      * renders all pages
-//!      * saves every page's thumbnail
-//!      * computes every page's pHash
-//!      * **batches all pages through CLIP in one ONNX forward pass**
-//!      * inserts the batch of vectors into the HNSW index
-//!      * **upserts every page row inside a single SQLite transaction**
-//!   4. Periodically saves the vector index (crash-recovery checkpoint).
+//! * A fixed-size rayon thread pool drains the queue.  Each worker thread
+//!   owns one long-lived [`WorkerProcess`] subprocess (the same binary
+//!   re-launched with `--worker-mode`) that does the actual pdfium / CLIP
+//!   work.  The parent thread:
+//!   1. Upserts the file row and bumps the persistent `crash_attempts`
+//!      counter (durable in WAL — survives an FFI crash).
+//!   2. Sends the file to the subprocess and waits for one response.
+//!   3. On `Indexed`, allocates HNSW ids, inserts the vectors, and persists
+//!      the page rows in a single SQLite transaction.
+//!   4. On `Excluded`, marks the file row excluded.
+//!   5. On a Rust-level `Error`, increments the failed counter and resets
+//!      the crash attempt counter (this kind of failure is recoverable).
+//!   6. On a broken pipe / EOF (subprocess crashed), respawns a fresh
+//!      subprocess and **leaves the crash counter incremented** so the next
+//!      run's filter step can apply the auto-blacklist threshold.
+//!   7. Periodically saves the vector index (crash-recovery checkpoint).
 
 use crate::{
     config::Config,
-    embedder::clip::{ClipEmbedder, ClipSession},
-    embedder::phash::compute_phash,
     error::Result,
-    indexer::{pdf_processor, scanner::DiscoveredFile},
-    search::vector_index::{VectorId, VectorIndex},
-    storage::{
-        database::{self, DbPool, PageUpsert},
-        thumbnail::{ThumbnailStore, THUMB_SIZE},
+    indexer::{
+        scanner::DiscoveredFile,
+        subprocess::{PageData, ProcessRequest, ProcessResponse, WorkerProcess},
     },
+    search::vector_index::{VectorId, VectorIndex},
+    storage::database::{self, DbPool, PageUpsert},
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
-use pdfium_render::prelude::Pdfium;
-use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -70,16 +71,15 @@ impl IndexProgress {
     }
 }
 
-/// Run full indexing of `files` using a thread pool of `worker_threads` threads.
+/// Run full indexing of `files` using a thread pool of `worker_threads`
+/// threads, each driving its own subprocess.
 ///
 /// This function blocks until all files are processed. Call it from a
 /// `tokio::task::spawn_blocking` context.
 pub fn run_batch(
     files: Vec<DiscoveredFile>,
     pool: DbPool,
-    clip: Arc<ClipEmbedder>,
     index: Arc<VectorIndex>,
-    thumb_store: Arc<ThumbnailStore>,
     config: Arc<Config>,
     progress: Arc<IndexProgress>,
 ) {
@@ -92,9 +92,9 @@ pub fn run_batch(
         return;
     }
 
-    tracing::info!("Starting batch index of {} files", n);
+    tracing::info!("Starting batch index of {} files (out-of-process)", n);
 
-    // Bounded channel prevents unbounded memory growth
+    // Bounded channel prevents unbounded memory growth.
     let (tx, rx): (Sender<DiscoveredFile>, Receiver<DiscoveredFile>) = bounded(64);
 
     // Producer thread — feeds files into the channel.
@@ -110,120 +110,39 @@ pub fn run_batch(
         .build()
         .expect("Failed to build rayon thread pool");
 
+    let model_path = config.paths.model_path.clone();
+    let thumbnails_dir = config.thumbnails_dir();
+
     pool_rayon.scope(|scope| {
         for worker_idx in 0..num_threads {
             let rx = rx.clone();
             let db_pool = pool.clone();
-            let clip = clip.clone();
             let index = index.clone();
-            let thumb_store = thumb_store.clone();
-            let config = config.clone();
             let progress = progress.clone();
+            let model_path = model_path.clone();
+            let thumbnails_dir = thumbnails_dir.clone();
 
             scope.spawn(move |_| {
-                // One PDFium per worker thread (PDFium is !Send).
-                let pdfium = match pdf_processor::init_pdfium() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("[worker {}] Failed to init PDFium: {}", worker_idx, e);
-                        return;
-                    }
-                };
-
-                // One CLIP session per worker — true parallel inference.
-                // Per-session intra-op threads = 1 so the outer rayon pool
-                // supplies all parallelism.  If workers exceed core count,
-                // ORT's internal scheduler still cooperates, but the default
-                // minimises oversubscription.
-                let mut clip_session = match clip.new_session(1) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(
-                            "[worker {}] Failed to build CLIP session: {}",
-                            worker_idx, e
-                        );
-                        return;
-                    }
-                };
-
-                // Single-threaded tokio runtime per worker for async DB calls.
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Worker tokio runtime");
-
-                while let Ok(file) = rx.recv() {
-                    // `catch_unwind` prevents a panic in pdfium-render / hnsw_rs
-                    // from unwinding the rayon scope and bypassing the final
-                    // `progress.finished = true` — which would leave the UI
-                    // progress bar stuck forever.
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        rt.block_on(process_one_file(
-                            &file,
-                            &pdfium,
-                            &db_pool,
-                            &mut clip_session,
-                            &index,
-                            &thumb_store,
-                            &config,
-                        ))
-                    }));
-
-                    match result {
-                        Ok(Ok(FileOutcome::Indexed)) => {
-                            progress.processed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(Ok(FileOutcome::Excluded)) => {
-                            progress.excluded.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Failed to index {}: {}", file.path.display(), e);
-                            progress.failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(panic_payload) => {
-                            let msg = panic_payload
-                                .downcast_ref::<&'static str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| {
-                                    panic_payload.downcast_ref::<String>().cloned()
-                                })
-                                .unwrap_or_else(|| "<non-string panic>".to_string());
-                            tracing::error!(
-                                "Panic while indexing {}: {}",
-                                file.path.display(),
-                                msg
-                            );
-                            progress.failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-
-                    let done = progress.processed.load(Ordering::Relaxed)
-                        + progress.failed.load(Ordering::Relaxed)
-                        + progress.excluded.load(Ordering::Relaxed);
-
-                    if done % 500 == 0 {
-                        tracing::info!(
-                            "Progress: {}/{} files ({:.1}%)",
-                            done,
-                            n,
-                            progress.percent()
-                        );
-                        // Checkpoint the vector index (cheap on hnsw_rs).
-                        if let Err(e) = index.save() {
-                            tracing::warn!("Failed to save vector index: {}", e);
-                        }
-                    }
-                }
+                run_worker(
+                    worker_idx,
+                    rx,
+                    db_pool,
+                    index,
+                    progress,
+                    model_path,
+                    thumbnails_dir,
+                    n,
+                );
             });
         }
     });
 
-    // Final authoritative save
+    // Final authoritative save.
     if let Err(e) = index.save() {
         tracing::error!("Failed to save vector index after batch: {}", e);
     }
 
-    // Reconcile counters to ensure 100% is reached
+    // Reconcile counters to ensure 100% is reached.
     let p = progress.processed.load(Ordering::Relaxed);
     let e = progress.excluded.load(Ordering::Relaxed);
     let f = progress.failed.load(Ordering::Relaxed);
@@ -232,10 +151,8 @@ pub fn run_batch(
 
     if actual_done < total {
         let missing = total - actual_done;
-        // Add any missing counts to failed to ensure p + e + f == total
         progress.failed.fetch_add(missing, Ordering::Relaxed);
     } else if actual_done > total && total > 0 {
-        // This shouldn't happen, but for safety:
         progress.total.store(actual_done, Ordering::Relaxed);
     }
 
@@ -250,105 +167,234 @@ pub fn run_batch(
     );
 }
 
-enum FileOutcome {
-    Indexed,
-    Excluded,
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    worker_idx: usize,
+    rx: Receiver<DiscoveredFile>,
+    db_pool: DbPool,
+    index: Arc<VectorIndex>,
+    progress: Arc<IndexProgress>,
+    model_path: PathBuf,
+    thumbnails_dir: PathBuf,
+    total_files: usize,
+) {
+    // Single-threaded tokio runtime per worker for async DB calls.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Worker tokio runtime");
+
+    let mut subproc = match WorkerProcess::spawn(&model_path, &thumbnails_dir, worker_idx) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(
+                "[worker {}] Failed to spawn indexing subprocess: {}",
+                worker_idx, e
+            );
+            return;
+        }
+    };
+
+    while let Ok(file) = rx.recv() {
+        // Diagnostic breadcrumb so the operator can see in-flight files
+        // after a parent-side panic.  (Subprocess crashes also log here
+        // before respawn.)
+        let _ = std::fs::write(
+            format!("./logs/last_{}.txt", worker_idx),
+            file.path.to_string_lossy().as_bytes(),
+        );
+
+        // Upsert + bump counter on the parent side — the child never touches
+        // the DB.
+        let file_id = match rt.block_on(database::upsert_file(
+            &db_pool,
+            &file.path.to_string_lossy(),
+            &file.filename,
+            &file.file_type,
+            file.file_size.map(|s| s as i64),
+            file.modified_at,
+        )) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to upsert file row for {}: {}",
+                    file.path.display(),
+                    e
+                );
+                progress.failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        if let Err(e) = rt.block_on(database::bump_crash_attempts(&db_pool, file_id)) {
+            tracing::warn!(
+                "Failed to bump crash_attempts for {}: {}",
+                file.path.display(),
+                e
+            );
+        }
+
+        let request = ProcessRequest {
+            file_path: file.path.clone(),
+            file_id,
+        };
+
+        let mut should_reset_counter = true;
+        match subproc.process(&request) {
+            Ok(ProcessResponse::Indexed { pages }) => {
+                handle_indexed(&rt, &db_pool, &index, file_id, &file.path, &pages, &progress);
+            }
+            Ok(ProcessResponse::Excluded { reason }) => {
+                if let Err(e) = rt.block_on(database::mark_file_excluded(&db_pool, file_id)) {
+                    tracing::warn!(
+                        "Failed to mark file excluded {}: {}",
+                        file.path.display(),
+                        e
+                    );
+                }
+                tracing::debug!(
+                    "Excluded (imposition): {} — {}",
+                    file.path.display(),
+                    reason
+                );
+                progress.excluded.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(ProcessResponse::Error { msg }) => {
+                tracing::warn!("Failed to index {}: {}", file.path.display(), msg);
+                progress.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // Broken pipe / EOF — subprocess died on this file.  Leave
+                // the crash counter bumped so the next run's filter can
+                // auto-blacklist the file once the threshold is reached.
+                tracing::error!(
+                    "[worker {}] subprocess crashed on {}: {}",
+                    worker_idx,
+                    file.path.display(),
+                    e
+                );
+                progress.failed.fetch_add(1, Ordering::Relaxed);
+                should_reset_counter = false;
+
+                subproc = match WorkerProcess::spawn(&model_path, &thumbnails_dir, worker_idx) {
+                    Ok(w) => w,
+                    Err(spawn_err) => {
+                        tracing::error!(
+                            "[worker {}] failed to respawn subprocess, exiting: {}",
+                            worker_idx, spawn_err
+                        );
+                        return;
+                    }
+                };
+            }
+        }
+
+        if should_reset_counter {
+            if let Err(e) = rt.block_on(database::reset_crash_attempts(&db_pool, file_id)) {
+                tracing::warn!(
+                    "Failed to reset crash_attempts for {}: {}",
+                    file.path.display(),
+                    e
+                );
+            }
+        }
+
+        let done = progress.processed.load(Ordering::Relaxed)
+            + progress.failed.load(Ordering::Relaxed)
+            + progress.excluded.load(Ordering::Relaxed);
+
+        if done % 500 == 0 {
+            tracing::info!(
+                "Progress: {}/{} files ({:.1}%)",
+                done,
+                total_files,
+                progress.percent()
+            );
+            // Checkpoint the vector index (cheap on hnsw_rs).
+            if let Err(e) = index.save() {
+                tracing::warn!("Failed to save vector index: {}", e);
+            }
+        }
+    }
 }
 
-/// Process a single file: render → batched embed → batched DB write.
-async fn process_one_file(
-    file: &DiscoveredFile,
-    pdfium: &Pdfium,
+fn handle_indexed(
+    rt: &tokio::runtime::Runtime,
     pool: &DbPool,
-    clip_session: &mut ClipSession,
     index: &VectorIndex,
-    thumb_store: &ThumbnailStore,
-    _config: &Config,
-) -> Result<FileOutcome> {
-    // ── 1. File row ───────────────────────────────────────────────────────────
-    let file_id = database::upsert_file(
-        pool,
-        &file.path.to_string_lossy(),
-        &file.filename,
-        &file.file_type,
-        file.file_size.map(|s| s as i64),
-        file.modified_at,
-    )
-    .await?;
-
-    // ── 2. Render + imposition filter ────────────────────────────────────────
-    let processed = pdf_processor::process_file(&file.path, pdfium)?;
-
-    if processed.excluded {
-        database::mark_file_excluded(pool, file_id).await?;
-        tracing::debug!(
-            "Excluded (imposition): {} — {}",
-            file.path.display(),
-            processed.exclusion_reason.as_deref().unwrap_or("?")
-        );
-        return Ok(FileOutcome::Excluded);
+    file_id: i64,
+    file_path: &std::path::Path,
+    pages: &[PageData],
+    progress: &IndexProgress,
+) {
+    if pages.is_empty() {
+        if let Err(e) = rt.block_on(database::mark_file_indexed(pool, file_id, 0)) {
+            tracing::warn!(
+                "Failed to mark file indexed {}: {}",
+                file_path.display(),
+                e
+            );
+            progress.failed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            progress.processed.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
     }
 
-    if processed.pages.is_empty() {
-        database::mark_file_indexed(pool, file_id, 0).await?;
-        return Ok(FileOutcome::Indexed);
-    }
-
-    // ── 3. Thumbnails (sequential — disk-bound, cheap per image) ─────────────
-    let mut thumb_paths = Vec::with_capacity(processed.pages.len());
-    for p in &processed.pages {
-        let t =
-            thumb_store.save_thumbnail(&p.image, file_id, p.page_num as i64, THUMB_SIZE)?;
-        thumb_paths.push(t);
-    }
-
-    // ── 4. pHashes (CPU-bound, short, fine to do sequentially) ───────────────
-    let phashes: Vec<String> = processed.pages.iter().map(|p| compute_phash(&p.image)).collect();
-
-    // ── 5. CLIP in a single forward pass across every page ───────────────────
-    let img_refs: Vec<&image::DynamicImage> =
-        processed.pages.iter().map(|p| &p.image).collect();
-    let vectors = clip_session.encode_batch(&img_refs)?;
-
-    if vectors.len() != processed.pages.len() {
-        return Err(crate::error::AppError::Search(format!(
-            "CLIP batch size mismatch: expected {}, got {}",
-            processed.pages.len(),
-            vectors.len()
-        )));
-    }
-
-    // ── 6. Allocate ids and insert the whole batch into HNSW at once ─────────
-    let vector_ids: Vec<VectorId> = (0..processed.pages.len()).map(|_| index.next_id()).collect();
+    // Allocate HNSW ids and insert the whole batch.
+    let vector_ids: Vec<VectorId> = (0..pages.len()).map(|_| index.next_id()).collect();
     let vec_batch: Vec<(VectorId, Vec<f32>)> = vector_ids
         .iter()
-        .zip(vectors.into_iter())
-        .map(|(id, v)| (*id, v))
+        .zip(pages.iter())
+        .map(|(id, p)| (*id, p.vector.clone()))
         .collect();
-    index.add_batch(&vec_batch)?;
 
-    // ── 7. Single transaction for every page row ─────────────────────────────
-    let rows: Vec<PageUpsert<'_>> = processed
-        .pages
+    if let Err(e) = index.add_batch(&vec_batch) {
+        tracing::warn!(
+            "HNSW insert failed for {}: {}",
+            file_path.display(),
+            e
+        );
+        progress.failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // Persist page rows in a single transaction.
+    let rows: Vec<PageUpsert<'_>> = pages
         .iter()
         .enumerate()
         .map(|(i, p)| PageUpsert {
             page_num: p.page_num as i64,
-            phash: Some(phashes[i].as_str()),
+            phash: Some(p.phash.as_str()),
             vector_id: Some(vector_ids[i] as i64),
-            thumb_path: Some(thumb_paths[i].as_str()),
+            thumb_path: Some(p.thumb_relative_path.as_str()),
             width_px: Some(p.width_px as i64),
             height_px: Some(p.height_px as i64),
         })
         .collect();
-    database::upsert_pages_batch(pool, file_id, &rows).await?;
 
-    database::mark_file_indexed(pool, file_id, processed.page_count as i64).await?;
-    tracing::debug!(
-        "Indexed: {} ({} pages)",
-        file.path.display(),
-        processed.page_count
-    );
+    let outcome: Result<()> = rt.block_on(async {
+        database::upsert_pages_batch(pool, file_id, &rows).await?;
+        database::mark_file_indexed(pool, file_id, pages.len() as i64).await?;
+        Ok(())
+    });
 
-    Ok(FileOutcome::Indexed)
+    match outcome {
+        Ok(()) => {
+            tracing::debug!(
+                "Indexed: {} ({} pages)",
+                file_path.display(),
+                pages.len()
+            );
+            progress.processed.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to persist indexed pages for {}: {}",
+                file_path.display(),
+                e
+            );
+            progress.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }

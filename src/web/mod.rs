@@ -19,6 +19,7 @@ use crate::{
 };
 use axum::{
     extract::DefaultBodyLimit,
+    http::header,
     routing::{get, post},
     Router,
 };
@@ -34,7 +35,6 @@ pub fn build_router(
     engine: SearchEngine,
     pool: DbPool,
     progress: Arc<IndexProgress>,
-    static_dir: &Path,
     thumbnails_dir: &Path,
     config_path: std::path::PathBuf,
     clip: Arc<ClipEmbedder>,
@@ -74,9 +74,12 @@ pub fn build_router(
         // WebSocket route (different state type)
         .route("/ws/progress", get(ws_handler))
         .with_state(ws_state)
-        // Static files
+        // Thumbnails (dynamic, served from filesystem)
         .nest_service("/thumbnails", ServeDir::new(thumbnails_dir))
-        .nest_service("/static", ServeDir::new(static_dir))
+        // Frontend static files — embedded into the binary at compile time
+        // so they work regardless of deployment directory.
+        .route("/static/style.css", get(serve_css))
+        .route("/static/app.js", get(serve_js))
         .route("/", get(serve_index))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -85,6 +88,22 @@ pub fn build_router(
 /// Serve the main HTML page.
 async fn serve_index() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("static/index.html"))
+}
+
+/// Serve the compiled-in CSS stylesheet.
+async fn serve_css() -> impl axum::response::IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("static/style.css"),
+    )
+}
+
+/// Serve the compiled-in JavaScript application.
+async fn serve_js() -> impl axum::response::IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("static/app.js"),
+    )
 }
 
 /// Start the HTTP server, binding to `host:port` from config.

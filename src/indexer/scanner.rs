@@ -22,7 +22,11 @@ pub struct DiscoveredFile {
 /// Scan every directory in `scan_dirs` recursively and return all PDF/AI files found.
 ///
 /// Symbolic links are followed once (to avoid infinite loops).
-pub fn scan_directories(scan_dirs: &[PathBuf]) -> Vec<DiscoveredFile> {
+///
+/// `max_depth` bounds recursion: 0 = root directory only, 1 = root + immediate
+/// children, etc.  See [`crate::config::IndexerConfig::effective_max_scan_depth`]
+/// for the hard cap.
+pub fn scan_directories(scan_dirs: &[PathBuf], max_depth: u32) -> Vec<DiscoveredFile> {
     let mut files = Vec::new();
 
     for root in scan_dirs {
@@ -31,16 +35,29 @@ pub fn scan_directories(scan_dirs: &[PathBuf]) -> Vec<DiscoveredFile> {
             continue;
         }
 
-        tracing::info!("Scanning directory: {}", root.display());
+        tracing::info!(
+            "Scanning directory (max_depth={}): {}",
+            max_depth,
+            root.display()
+        );
 
         for entry in WalkDir::new(root)
             .follow_links(true)
+            .max_depth(max_depth as usize)
             .into_iter()
             .filter_map(|e| {
                 match e {
                     Ok(entry) => Some(entry),
                     Err(err) => {
-                        tracing::warn!("Scan error: {}", err);
+                        // Windows can return "access denied" (os error 5) even
+                        // for the Administrator account on system-owned dirs
+                        // such as `<drive>:\System Volume Information` or
+                        // `<drive>:\$RECYCLE.BIN`. Include the offending path so
+                        // the operator can see which directory was skipped.
+                        match err.path() {
+                            Some(path) => tracing::warn!("Scan error at {}: {}", path.display(), err),
+                            None => tracing::warn!("Scan error: {}", err),
+                        }
                         None
                     }
                 }

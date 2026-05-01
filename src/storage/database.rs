@@ -19,6 +19,14 @@ pub struct FileRecord {
     pub is_excluded: i64,
     pub indexed_at: Option<i64>,
     pub created_at: i64,
+    /// Number of consecutive indexing attempts that did not reach a Rust-level
+    /// success or error (i.e. the worker process was terminated mid-attempt,
+    /// almost always by an FFI structured exception).  Used by
+    /// `start_full_index` to auto-blacklist poison-pill files.
+    pub crash_attempts: i64,
+    /// Free-form note describing why the file is excluded.  NULL on rows that
+    /// pre-date this column.
+    pub exclusion_reason: Option<String>,
 }
 
 /// Page record from the `pages` table
@@ -128,6 +136,47 @@ pub async fn upsert_file(
 /// Mark a file as excluded (imposition/layout file).
 pub async fn mark_file_excluded(pool: &DbPool, file_id: i64) -> Result<()> {
     sqlx::query("UPDATE files SET is_excluded = 1 WHERE id = ?1")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Mark a file as excluded with a human-readable reason recorded in the
+/// `exclusion_reason` column.  Used by the auto-blacklist for crashed files
+/// so operators can audit why something was skipped.
+pub async fn mark_file_excluded_with_reason(
+    pool: &DbPool,
+    file_id: i64,
+    reason: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE files SET is_excluded = 1, exclusion_reason = ?2 WHERE id = ?1")
+        .bind(file_id)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Increment `crash_attempts` for a file row and return the new value.
+/// Must be committed BEFORE any FFI work that could terminate the process,
+/// so that the increment survives an unrecoverable native crash.
+pub async fn bump_crash_attempts(pool: &DbPool, file_id: i64) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "UPDATE files SET crash_attempts = crash_attempts + 1 \
+         WHERE id = ?1 RETURNING crash_attempts",
+    )
+    .bind(file_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Reset `crash_attempts` to 0.  Called once a file has been processed to
+/// completion at the Rust level (success or a non-crash error/panic) so that
+/// only true FFI crashes accumulate the counter.
+pub async fn reset_crash_attempts(pool: &DbPool, file_id: i64) -> Result<()> {
+    sqlx::query("UPDATE files SET crash_attempts = 0 WHERE id = ?1")
         .bind(file_id)
         .execute(pool)
         .await?;

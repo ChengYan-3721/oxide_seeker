@@ -5,11 +5,10 @@
 
 use crate::{
     config::Config,
-    embedder::clip::ClipEmbedder,
     error::Result,
     indexer::worker_pool,
     search::vector_index::VectorIndex,
-    storage::{database::DbPool, thumbnail::ThumbnailStore},
+    storage::database::DbPool,
 };
 use notify::{
     event::{CreateKind, ModifyKind, RemoveKind},
@@ -26,12 +25,14 @@ use tokio::sync::mpsc;
 ///
 /// Returns a `RecommendedWatcher` handle; dropping it stops the watcher.
 /// Changed/created PDF and AI files are re-indexed automatically.
+///
+/// PDF rendering / CLIP inference are delegated to worker subprocesses (see
+/// [`super::worker_pool`]), so this watcher does not require an in-process
+/// CLIP embedder or thumbnail store.
 pub async fn start_watcher(
     config: Arc<Config>,
     pool: DbPool,
-    clip: Arc<ClipEmbedder>,
     index: Arc<VectorIndex>,
-    thumb_store: Arc<ThumbnailStore>,
 ) -> Result<RecommendedWatcher> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
     let (del_tx, mut del_rx) = mpsc::unbounded_channel::<PathBuf>();
@@ -39,9 +40,7 @@ pub async fn start_watcher(
     // Spawn a task that drains the channel and re-indexes changed files
     let config_clone = config.clone();
     let pool_clone = pool.clone();
-    let clip_clone = clip.clone();
     let index_clone = index.clone();
-    let thumb_clone = thumb_store.clone();
 
     tokio::spawn(async move {
         // Debounce: collect events for up to 2s before triggering indexing
@@ -146,13 +145,11 @@ pub async fn start_watcher(
 
                     let cfg = config_clone.clone();
                     let p = pool_clone.clone();
-                    let c = clip_clone.clone();
                     let i = index_clone.clone();
-                    let t = thumb_clone.clone();
                     let progress = worker_pool::IndexProgress::new(discovered.len() as u64);
 
                     tokio::task::spawn_blocking(move || {
-                        worker_pool::run_batch(discovered, p, c, i, t, cfg, progress);
+                        worker_pool::run_batch(discovered, p, i, cfg, progress);
                     });
                 }
             }

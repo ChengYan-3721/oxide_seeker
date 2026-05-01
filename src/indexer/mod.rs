@@ -3,6 +3,7 @@
 pub mod filter;
 pub mod pdf_processor;
 pub mod scanner;
+pub mod subprocess;
 pub mod watcher;
 pub mod worker_pool;
 
@@ -10,10 +11,9 @@ pub use worker_pool::IndexProgress;
 
 use crate::{
     config::Config,
-    embedder::clip::ClipEmbedder,
     error::Result,
     search::vector_index::VectorIndex,
-    storage::{database::DbPool, thumbnail::ThumbnailStore},
+    storage::database::DbPool,
 };
 use std::sync::Arc;
 
@@ -26,18 +26,22 @@ use std::sync::Arc;
 /// `progress` is the caller-owned Arc that is also passed to the WebSocket
 /// handler so both share the same live counters.  The total is updated here
 /// once the file list is known.
+///
+/// PDF rendering and CLIP inference run in worker subprocesses (see
+/// [`subprocess::WorkerProcess`]), so the parent never needs a `ClipEmbedder`
+/// or `ThumbnailStore` of its own — the model path and thumbnails dir come
+/// straight out of `config`.
 pub async fn start_full_index(
     config: Arc<Config>,
     pool: DbPool,
-    clip: Arc<ClipEmbedder>,
     index: Arc<VectorIndex>,
-    thumb_store: Arc<ThumbnailStore>,
     progress: Arc<IndexProgress>,
 ) -> Result<()> {
     // 1. Scan directories
     let all_files = {
         let dirs = config.paths.scan_dirs.clone();
-        tokio::task::spawn_blocking(move || scanner::scan_directories(&dirs))
+        let max_depth = config.indexer.effective_max_scan_depth();
+        tokio::task::spawn_blocking(move || scanner::scan_directories(&dirs, max_depth))
             .await
             .map_err(|e| crate::error::AppError::Other(anyhow::anyhow!("Scan task panicked: {}", e)))?
     };
@@ -76,6 +80,13 @@ pub async fn start_full_index(
     }
 
     // 2. Filter to only files needing (re-)indexing
+    // Files whose `crash_attempts` counter reached this threshold on previous
+    // runs are presumed to be FFI poison-pills (pdfium / onnxruntime raising
+    // a structured exception that catch_unwind cannot catch).  We auto-blacklist
+    // them with a clear `exclusion_reason` so operators can see what was
+    // skipped and why.
+    const CRASH_ATTEMPT_THRESHOLD: i64 = 2;
+
     let mut to_index = Vec::new();
     for file in all_files {
         match crate::storage::database::get_file_by_path(
@@ -84,6 +95,26 @@ pub async fn start_full_index(
         )
         .await?
         {
+            Some(rec) if rec.crash_attempts >= CRASH_ATTEMPT_THRESHOLD => {
+                if rec.is_excluded == 0 {
+                    let reason = format!(
+                        "Process crashed {} times while indexing this file (suspected FFI poison pill)",
+                        rec.crash_attempts
+                    );
+                    tracing::warn!(
+                        "Auto-excluding file after {} crashes: {} ({})",
+                        rec.crash_attempts,
+                        file.path.display(),
+                        reason
+                    );
+                    crate::storage::database::mark_file_excluded_with_reason(
+                        &pool,
+                        rec.id,
+                        &reason,
+                    )
+                    .await?;
+                }
+            }
             Some(rec) if !scanner::needs_reindex(&file.path, rec.indexed_at) => {
                 // File is up-to-date; skip
             }
@@ -105,7 +136,7 @@ pub async fn start_full_index(
 
     // 3. Run the worker pool in a blocking task (CPU-intensive)
     tokio::task::spawn_blocking(move || {
-        worker_pool::run_batch(to_index, pool, clip, index, thumb_store, config, progress_clone);
+        worker_pool::run_batch(to_index, pool, index, config, progress_clone);
     });
 
     Ok(())

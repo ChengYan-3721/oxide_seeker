@@ -39,6 +39,16 @@ impl ThumbnailStore {
         })
     }
 
+    /// Synchronous constructor for environments without a tokio runtime
+    /// (notably the indexing worker subprocess, which has no async surface
+    /// of its own).
+    pub fn new_sync(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        Ok(Self {
+            root: dir.to_path_buf(),
+        })
+    }
+
     /// Generate a thumbnail, save it to disk, and return the relative path.
     ///
     /// The file name is derived from `file_id` and `page_num` so re-indexing

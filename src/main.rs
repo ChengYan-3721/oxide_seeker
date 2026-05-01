@@ -6,6 +6,7 @@
 //! Defaults to `config.toml` in the current directory.
 
 mod config;
+mod crash_handler;
 mod embedder;
 mod error;
 mod indexer;
@@ -13,6 +14,7 @@ mod search;
 mod storage;
 mod license;
 mod web;
+mod worker_proc;
 
 use crate::{
     config::Config,
@@ -27,9 +29,40 @@ use std::{path::PathBuf, sync::Arc};
 use single_instance::SingleInstance;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Sentinel CLI flag that re-launches this same binary as an indexing worker
+/// subprocess.  Detected before the tokio runtime / single-instance check so
+/// children don't fight the parent for the global lock.
+pub const WORKER_MODE_FLAG: &str = "--worker-mode";
+
+fn main() -> anyhow::Result<()> {
+    // Re-execute paths first: if we were spawned as a worker subprocess, run
+    // the synchronous request loop and exit when stdin closes.  Done before
+    // any tokio / single-instance / chdir setup since those would interfere
+    // with parent-controlled stdin/stdout pipes.
+    if std::env::args().any(|a| a == WORKER_MODE_FLAG) {
+        // Set working directory to the exe folder so relative paths used by
+        // pdfium / models behave the same as in the parent.
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                let _ = std::env::set_current_dir(dir);
+            }
+        }
+        return worker_proc::run();
+    }
+
+    // Build a multi-thread tokio runtime by hand so the worker-mode early
+    // return above doesn't pay the cost.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // 检查程序是否已经在运行 (使用唯一的字符串标识)
     let instance = SingleInstance::new("oxide_seeker_lock")?;
     if !instance.is_single() {
@@ -43,16 +76,45 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Logging
-    tracing_subscriber::fmt()
+    // Logging: console (info+) + rolling file (warn+, daily, keep 7 days).
+    // The file layer writes synchronously: a non_blocking worker thread would
+    // be killed by an FFI segfault before flushing its buffer, so warn+ records
+    // emitted near a crash would be lost.
+    let log_dir = std::path::Path::new("./logs");
+    std::fs::create_dir_all(log_dir).ok();
+
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("oxide_seeker")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(log_dir)
+        .expect("failed to initialise rolling file logger");
+
+    let console_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("oxide_seeker=info,warn"));
+    let file_filter = EnvFilter::new("warn");
+
+    let console_layer = tracing_subscriber::fmt::layer()
         .with_timer(time::LocalTime::rfc_3339())
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("oxide_seeker=info,warn")),
-        )
         .with_target(false)
         .compact()
+        .with_filter(console_filter);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_timer(time::LocalTime::rfc_3339())
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(file_appender)
+        .with_filter(file_filter);
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
         .init();
+
+    // Crash recording: panic hook + Windows SEH filter writing to crash.log.
+    crash_handler::install(log_dir, "parent");
 
     // Config
     let config_path = parse_config_arg();
@@ -120,9 +182,7 @@ async fn main() -> anyhow::Result<()> {
         indexer::start_full_index(
             config.clone(),
             pool.clone(),
-            clip.clone(),
             vector_index.clone(),
-            thumb_store.clone(),
             progress.clone(),
         )
         .await?;
@@ -137,9 +197,7 @@ async fn main() -> anyhow::Result<()> {
             let _watcher = indexer::watcher::start_watcher(
                 config.clone(),
                 pool.clone(),
-                clip.clone(),
                 vector_index.clone(),
-                thumb_store.clone(),
             )
             .await?;
 
@@ -154,18 +212,12 @@ async fn main() -> anyhow::Result<()> {
     // Web server
     // `progress` is the same Arc shared with the indexer worker pool so
     // WebSocket clients see live counters.
-    let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src/web/static");
-
-    // Thumbnails are stored under data_dir/thumbnails at runtime; pass the
-    // resolved path so the static file service points to the right directory.
     let thumbnails_dir = config.thumbnails_dir();
 
     let router = web::build_router(
         engine,
         pool.clone(),
         progress,
-        &static_dir,
         &thumbnails_dir,
         config_path,
         clip,
