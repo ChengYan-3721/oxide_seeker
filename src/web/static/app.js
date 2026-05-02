@@ -23,6 +23,8 @@ const dirList = document.getElementById('dirList');
 const addDirBtn = document.getElementById('addDirBtn');
 const saveSettings = document.getElementById('saveSettings');
 const saveStatus = document.getElementById('saveStatus');
+const settingsTitle = document.querySelector('#settingsModal .modal-header h3');
+const settingsHint = document.querySelector('#settingsModal .modal-body .hint');
 
 const licenseBtn = document.getElementById('licenseBtn');
 const licenseModal = document.getElementById('licenseModal');
@@ -41,6 +43,8 @@ let wsRetryTimer = null;
 let indexFinished = false; // Guard to prevent progress bar re-showing after finish
 let currentScanDirs = [];
 let licenseAllowsSearch = false;
+let isLocal = false;
+let pathMappings = {};
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function formatBytes(bytes) {
@@ -82,6 +86,38 @@ function copyText(text) {
   });
 }
 
+function loadPathMappings() {
+  try {
+    const stored = localStorage.getItem('pathMappings');
+    if (stored) {
+      pathMappings = JSON.parse(stored);
+    }
+  } catch (e) {
+    console.error('Failed to load path mappings from localStorage', e);
+    pathMappings = {};
+  }
+}
+
+function getMappedPath(originalPath) {
+  if (isLocal || Object.keys(pathMappings).length === 0) {
+    return originalPath;
+  }
+  for (const serverPath of Object.keys(pathMappings)) {
+    if (originalPath.startsWith(serverPath)) {
+      const mappedDrive = pathMappings[serverPath];
+      // 确保原始路径和映射驱动器的斜杠一致
+      const serverPathWithSlash = serverPath.endsWith('\\') || serverPath.endsWith('/') ? serverPath : serverPath + '\\';
+      const mappedDriveWithSlash = mappedDrive.endsWith('\\') || mappedDrive.endsWith('/') ? mappedDrive : mappedDrive + '\\';
+      
+      // 替换时，我们假设服务器和客户端都使用 `\` 作为分隔符，或者都是 `/`
+      // Rust 服务端总是返回 `\` 分隔的路径
+      return mappedDriveWithSlash + originalPath.substring(serverPathWithSlash.length);
+    }
+  }
+  return originalPath;
+}
+
+
 // ── Image selection ───────────────────────────────────────────────────────────
 function setImage(file) {
  if (!file || !file.type.startsWith('image/')) {
@@ -114,7 +150,7 @@ clearBtn.addEventListener('click', (e) => {
   clearImage();
 });
 
-// ── Drag & Drop ─��─────────────────────────────────────────────────────────────
+// ── Drag & Drop ───────────────────────────────────────────────────────────────
 dropZone.addEventListener('dragover', (e) => {
   e.preventDefault();
   dropZone.classList.add('drag-over');
@@ -140,7 +176,7 @@ fileInput.addEventListener('change', () => {
   fileInput.value = '';
 });
 
-// ── Clipboard paste ────────────────────────────────────────────────��──────────
+// ── Clipboard paste ──────────────────────────────────────────────────────────
 document.addEventListener('paste', (e) => {
   const items = e.clipboardData?.items;
   if (!items) return;
@@ -155,7 +191,7 @@ document.addEventListener('paste', (e) => {
   }
 });
 
-// ── Search ──────────────────────��─────────────────────────────────────────────
+// ── Search ───────────────────────────────────────────────────────────────────
 searchBtn.addEventListener('click', runSearch);
 
 async function runSearch() {
@@ -244,13 +280,14 @@ function buildCard(r) {
   });
 
   const pathEl = card.querySelector('.card-path');
-  pathEl.textContent = r.file_path;
+  const mappedPath = getMappedPath(r.file_path);
+  pathEl.textContent = mappedPath;
   pathEl.title = '点击复制路径';
   pathEl.addEventListener('click', () => {
-    copyText(r.file_path).then(() => {
+    copyText(mappedPath).then(() => {
       pathEl.textContent = '✓ 已复制';
       setTimeout(() => {
-        pathEl.textContent = r.file_path;
+        pathEl.textContent = mappedPath;
       }, 1500);
     }).catch((e) => {
       alert('复制失败：' + e.message);
@@ -353,19 +390,29 @@ async function initSettings() {
     }
     const data = await resp.json();
     console.log('Config received:', data);
-    if (data.is_local) {
-      console.log('Local access detected, showing settings button');
-      settingsBtn.hidden = false;
-      currentScanDirs = data.scan_dirs || [];
-      renderDirList();
-      if (currentScanDirs.length === 0) {
-        console.log('No scan directories configured, showing settings modal automatically');
-        settingsModal.hidden = false;
-      } else {
-        settingsModal.hidden = true;
-      }
+    
+    isLocal = data.is_local;
+    currentScanDirs = data.scan_dirs || [];
+    settingsBtn.hidden = false; // Always show settings button
+    loadPathMappings();
+
+    if (isLocal) {
+      settingsTitle.textContent = '设置扫描目录';
+      settingsHint.textContent = '这些目录将被扫描以查找 PDF 和 AI 文件。目前仅支持本地服务器路径。';
+      addDirBtn.hidden = false;
     } else {
-      console.warn('Non-local access detected (is_local: false), settings button hidden. IP might not be in loopback range.');
+      settingsTitle.textContent = '设置路径映射';
+      settingsHint.textContent = '将服务器扫描目录映射到您电脑上的盘符，方便快速访问文件。';
+      addDirBtn.hidden = true;
+    }
+
+    renderDirList();
+
+    if (isLocal && currentScanDirs.length === 0) {
+      console.log('No scan directories configured, showing settings modal automatically');
+      settingsModal.hidden = false;
+    } else {
+      settingsModal.hidden = true;
     }
   } catch (e) { console.error('Failed to fetch config', e); }
 }
@@ -373,27 +420,69 @@ async function initSettings() {
 function renderDirList(dirs) {
   const list = dirs || currentScanDirs;
   dirList.innerHTML = '';
-  list.forEach((dir, index) => {
-    const item = document.createElement('div');
-    item.className = 'dir-item';
-    item.innerHTML = `
-      <input type="text" class="dir-input" value="${dir}" data-index="${index}" placeholder="例如: C:\\Users\\Documents" />
-      <button class="remove-btn" data-index="${index}" title="移除">✕</button>
-    `;
-    dirList.appendChild(item);
-  });
+
+  if (isLocal) {
+    list.forEach((dir, index) => {
+      const item = document.createElement('div');
+      item.className = 'dir-item';
+      item.innerHTML = `
+        <input type="text" class="dir-input" value="${dir}" data-index="${index}" placeholder="例如: C:\\Users\\Documents" />
+        <button class="remove-btn" data-index="${index}" title="移除">✕</button>
+      `;
+      dirList.appendChild(item);
+    });
+  } else {
+    // LAN user: show mapping UI
+    list.forEach((dir) => {
+      if (!dir) return;
+      const item = document.createElement('div');
+      item.className = 'dir-item-map';
+      const mappedValue = pathMappings[dir] || '';
+      item.innerHTML = `
+        <div class="server-path-wrap">
+          <label>服务器路径</label>
+          <span class="server-path">${dir}</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="local-path-wrap">
+          <label>本地映射路径</label>
+          <input type="text" class="dir-input-map" value="${mappedValue}" data-server-path="${dir}" placeholder="例如: Z:\\" />
+        </div>
+      `;
+      dirList.appendChild(item);
+    });
+  }
 }
 
 function getEditingDirs() {
-  const inputs = dirList.querySelectorAll('.dir-input');
-  return Array.from(inputs).map(i => i.value.trim());
+  if (isLocal) {
+    const inputs = dirList.querySelectorAll('.dir-input');
+    return Array.from(inputs).map(i => i.value.trim());
+  }
+  // For LAN users, this function returns the current mappings from the UI
+  const newMappings = {};
+  const inputs = dirList.querySelectorAll('.dir-input-map');
+  inputs.forEach(input => {
+    const serverPath = input.dataset.serverPath;
+    const localPath = input.value.trim();
+    if (serverPath && localPath) {
+      newMappings[serverPath] = localPath;
+    }
+  });
+  return newMappings;
 }
 
 function hasUnsavedChanges() {
-  const editing = getEditingDirs().filter(d => d !== '');
-  const saved = currentScanDirs.filter(d => d !== '');
-  if (editing.length !== saved.length) return true;
-  return editing.some((d, i) => d !== saved[i]);
+  if (isLocal) {
+    const editing = getEditingDirs().filter(d => d !== '');
+    const saved = currentScanDirs.filter(d => d !== '');
+    if (editing.length !== saved.length) return true;
+    return editing.some((d, i) => d !== saved[i]);
+  } else {
+    const editingMappings = getEditingDirs();
+    // Simple check: compare stringified versions
+    return JSON.stringify(editingMappings) !== JSON.stringify(pathMappings);
+  }
 }
 
 settingsBtn.addEventListener('click', () => {
@@ -412,13 +501,14 @@ closeSettings.addEventListener('click', () => {
 });
 
 addDirBtn.addEventListener('click', () => {
+  if (!isLocal) return;
   const editing = getEditingDirs();
   editing.push('');
   renderDirList(editing);
 });
 
 dirList.addEventListener('click', (e) => {
-  if (e.target.classList.contains('remove-btn')) {
+  if (isLocal && e.target.classList.contains('remove-btn')) {
     const index = parseInt(e.target.dataset.index, 10);
     const editing = getEditingDirs();
     editing.splice(index, 1);
@@ -427,41 +517,68 @@ dirList.addEventListener('click', (e) => {
 });
 
 saveSettings.addEventListener('click', async () => {
-  const inputs = dirList.querySelectorAll('.dir-input');
-  const dirs = Array.from(inputs).map(i => i.value.trim()).filter(d => d !== '');
-
   saveSettings.disabled = true;
   saveStatus.textContent = '保存中...';
   saveStatus.style.color = 'var(--text-muted)';
 
-  try {
-    const resp = await fetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_dirs: dirs })
-    });
-    if (!resp.ok) throw new Error(resp.statusText);
+  if (isLocal) {
+    // Local user: save scan directories to server
+    const inputs = dirList.querySelectorAll('.dir-input');
+    const dirs = Array.from(inputs).map(i => i.value.trim()).filter(d => d !== '');
+    try {
+      const resp = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scan_dirs: dirs })
+      });
+      if (!resp.ok) throw new Error(resp.statusText);
 
-    saveStatus.textContent = '保存成功！正在启动索引...';
-    saveStatus.style.color = 'var(--green)';
+      saveStatus.textContent = '保存成功！正在启动索引...';
+      saveStatus.style.color = 'var(--green)';
+      currentScanDirs = dirs;
 
-    // Update current state so it doesn't pop up again on refresh (if data was re-fetched)
-    // and so that re-opening the modal shows the correct dirs.
-    currentScanDirs = dirs;
+      setTimeout(() => { settingsModal.hidden = true; }, 1500);
+      setTimeout(pollStatus, 500);
+    } catch (e) {
+      saveStatus.textContent = '保存失败: ' + e.message;
+      saveStatus.style.color = 'var(--red)';
+    } finally {
+      saveSettings.disabled = false;
+    }
+  } else {
+    // LAN user: save path mappings to localStorage
+    try {
+      const newMappings = {};
+      const inputs = dirList.querySelectorAll('.dir-input-map');
+      inputs.forEach(input => {
+        const serverPath = input.dataset.serverPath;
+        let localPath = input.value.trim();
+        if (serverPath && localPath) {
+          // 自动处理末尾的斜杠
+          const serverEndsWithSlash = serverPath.endsWith('\\') || serverPath.endsWith('/');
+          const localEndsWithSlash = localPath.endsWith('\\') || localPath.endsWith('/');
+          if (serverEndsWithSlash && !localEndsWithSlash) {
+            localPath += '\\';
+          } else if (!serverEndsWithSlash && localEndsWithSlash) {
+            localPath = localPath.slice(0, -1);
+          }
+          newMappings[serverPath] = localPath;
+        }
+      });
+      
+      localStorage.setItem('pathMappings', JSON.stringify(newMappings));
+      pathMappings = newMappings;
 
-    // Close modal after a short delay
-    setTimeout(() => {
-        settingsModal.hidden = true;
-    }, 1500);
-
-    // Trigger immediate status poll to show "indexing"
-    setTimeout(pollStatus, 500);
-
-  } catch (e) {
-    saveStatus.textContent = '保存失败: ' + e.message;
-    saveStatus.style.color = 'var(--red)';
-  } finally {
-    saveSettings.disabled = false;
+      saveStatus.textContent = '映射已保存！';
+      saveStatus.style.color = 'var(--green)';
+      
+      setTimeout(() => { settingsModal.hidden = true; }, 1500);
+    } catch (e) {
+      saveStatus.textContent = '保存失败: ' + e.message;
+      saveStatus.style.color = 'var(--red)';
+    } finally {
+      saveSettings.disabled = false;
+    }
   }
 });
 
