@@ -245,23 +245,32 @@ pub async fn rank_results(
     Ok(results)
 }
 
+/// Maximum number of bind parameters per SQL statement.  Mirrors the constant
+/// in [`storage::database`]: SQLite's `SQLITE_MAX_VARIABLE_NUMBER` is 32766
+/// since 3.32 — staying at 16k keeps headroom for sqlx and any future composite
+/// queries.  Pages from a noise-pHash candidate flood (e.g. colour-chart
+/// images) can easily exceed 32k IDs in one round-trip.
+const SQL_BIND_CHUNK: usize = 16_000;
+
 /// Fetch multiple page records by their primary key IDs.
 async fn fetch_pages_by_ids(pool: &DbPool, ids: &[i64]) -> Result<Vec<PageRecord>> {
     if ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders: String = ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT * FROM pages WHERE id IN ({})", placeholders);
-    let mut query = sqlx::query_as::<_, PageRecord>(&sql);
-    for id in ids {
-        query = query.bind(id);
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(SQL_BIND_CHUNK) {
+        let placeholders: String = (1..=chunk.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT * FROM pages WHERE id IN ({})", placeholders);
+        let mut query = sqlx::query_as::<_, PageRecord>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        out.extend(query.fetch_all(pool).await?);
     }
-    Ok(query.fetch_all(pool).await?)
+    Ok(out)
 }
 
 /// Fetch multiple file records by their primary key IDs.
@@ -269,18 +278,20 @@ async fn fetch_files_by_ids(pool: &DbPool, ids: &[i64]) -> Result<Vec<FileRecord
     if ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders: String = ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT * FROM files WHERE id IN ({})", placeholders);
-    let mut query = sqlx::query_as::<_, FileRecord>(&sql);
-    for id in ids {
-        query = query.bind(id);
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(SQL_BIND_CHUNK) {
+        let placeholders: String = (1..=chunk.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT * FROM files WHERE id IN ({})", placeholders);
+        let mut query = sqlx::query_as::<_, FileRecord>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        out.extend(query.fetch_all(pool).await?);
     }
-    Ok(query.fetch_all(pool).await?)
+    Ok(out)
 }
 
 #[cfg(test)]

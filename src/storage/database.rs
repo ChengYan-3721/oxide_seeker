@@ -284,7 +284,16 @@ pub async fn upsert_pages_batch(
     Ok(())
 }
 
+/// Maximum number of bind parameters per SQL statement.  SQLite's compile-time
+/// `SQLITE_MAX_VARIABLE_NUMBER` defaults to 32766 since 3.32; we stay well
+/// below that to leave headroom for sqlx internals and any future composite
+/// queries.
+const SQL_BIND_CHUNK: usize = 16_000;
+
 /// Fetch pages by a list of vector IDs.
+///
+/// Splits the input into chunks of at most [`SQL_BIND_CHUNK`] so the generated
+/// `IN (?, ?, ...)` clause never exceeds SQLite's bind-parameter limit.
 pub async fn get_pages_by_vector_ids(
     pool: &DbPool,
     vector_ids: &[i64],
@@ -292,19 +301,23 @@ pub async fn get_pages_by_vector_ids(
     if vector_ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders: String = (1..=vector_ids.len())
-        .map(|i| format!("?{}", i))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT * FROM pages WHERE vector_id IN ({})",
-        placeholders
-    );
-    let mut query = sqlx::query_as::<_, PageRecord>(&sql);
-    for id in vector_ids {
-        query = query.bind(*id);
+    let mut out = Vec::with_capacity(vector_ids.len());
+    for chunk in vector_ids.chunks(SQL_BIND_CHUNK) {
+        let placeholders: String = (1..=chunk.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT * FROM pages WHERE vector_id IN ({})",
+            placeholders
+        );
+        let mut query = sqlx::query_as::<_, PageRecord>(&sql);
+        for id in chunk {
+            query = query.bind(*id);
+        }
+        out.extend(query.fetch_all(pool).await?);
     }
-    Ok(query.fetch_all(pool).await?)
+    Ok(out)
 }
 
 /// Return all (page_id, phash_hex) pairs for pHash candidate filtering.

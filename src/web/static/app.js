@@ -36,6 +36,7 @@ const licenseSaveBtn = document.getElementById('licenseSaveBtn');
 const machineIdText = document.getElementById('machineIdText');
 const copyMachineBtn = document.getElementById('copyMachineBtn');
 const licenseHeaderHint = document.getElementById('licenseHeaderHint');
+const scrollToTopBtn = document.getElementById('scrollToTopBtn');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let selectedFile = null; // File | null
@@ -132,6 +133,7 @@ function setImage(file) {
  clearBtn.classList.remove('hidden');
  dropZone.classList.add('has-image');
  searchBtn.disabled = !licenseAllowsSearch;
+ window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 function clearImage() {
@@ -692,6 +694,26 @@ licenseSaveBtn.addEventListener('click', async () => {
  } finally {
    licenseSaveBtn.disabled = false;
  }
+});
+
+// ── Scroll to top button logic ───────────────────────────────────────────────
+window.addEventListener('scroll', () => {
+  if (window.scrollY > 200) {
+    scrollToTopBtn.hidden = false;
+    scrollToTopBtn.classList.remove('hidden');
+  } else {
+    scrollToTopBtn.classList.add('hidden');
+    // Use a timeout to allow the fade-out animation to complete before setting hidden
+    setTimeout(() => {
+        if (window.scrollY <= 200) { // Re-check in case user scrolled back down
+            scrollToTopBtn.hidden = true;
+        }
+    }, 200);
+  }
+});
+
+scrollToTopBtn.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 
 initSettings();

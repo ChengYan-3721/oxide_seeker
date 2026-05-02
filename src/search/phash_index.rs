@@ -10,6 +10,17 @@ use crate::{
     storage::database::{self, DbPool},
 };
 
+/// Hard cap on how many pHash candidates we hand to the ranker.
+///
+/// Low-entropy queries — colour charts, GMG colour-management test pages,
+/// blank/solid-fill pages — produce pHashes that are within Hamming threshold
+/// of tens of thousands of unrelated library pages.  The ranker would then
+/// issue a single `SELECT ... WHERE id IN (?,?,...)` with that many binds,
+/// blowing past SQLite's `SQLITE_MAX_VARIABLE_NUMBER`.  The downstream code
+/// also chunks its `IN (...)` queries, but capping here keeps the work bounded
+/// upstream so we don't waste cycles ranking obvious noise.
+const MAX_PHASH_CANDIDATES: usize = 5_000;
+
 /// A candidate page found by pHash matching.
 #[derive(Debug, Clone)]
 pub struct PHashCandidate {
@@ -24,6 +35,10 @@ pub struct PHashCandidate {
 /// Loads all stored pHashes from SQLite (typically cached in the OS page cache)
 /// and computes distances in-process.  For 300 k pages the working set is only
 /// ~2.4 MB (300 000 × 8 bytes) so this fits comfortably in L3 cache.
+///
+/// Results are sorted by ascending distance and truncated to
+/// [`MAX_PHASH_CANDIDATES`] to keep low-entropy queries (e.g. colour charts)
+/// from flooding the ranker.
 pub async fn find_candidates(
     pool: &DbPool,
     query_hash: &str,
@@ -47,8 +62,16 @@ pub async fn find_candidates(
         })
         .collect();
 
-    // Sort by ascending Hamming distance
+    // Sort by ascending Hamming distance, then keep only the closest matches.
     candidates.sort_unstable_by_key(|c| c.distance);
+    if candidates.len() > MAX_PHASH_CANDIDATES {
+        tracing::debug!(
+            total = candidates.len(),
+            kept = MAX_PHASH_CANDIDATES,
+            "pHash candidate flood — truncating to closest matches"
+        );
+        candidates.truncate(MAX_PHASH_CANDIDATES);
+    }
 
     Ok(candidates)
 }
