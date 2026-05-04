@@ -3,6 +3,8 @@
 //! Provides both a one-shot full scan and a helper to check whether a known file
 //! has been modified since it was last indexed.
 
+use sha1::{Digest, Sha1};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
@@ -17,6 +19,11 @@ pub struct DiscoveredFile {
     pub file_size: Option<u64>,
     /// Modification time as Unix timestamp (seconds)
     pub modified_at: Option<i64>,
+    /// SHA-1 of the file's bytes, if already computed by an upstream stage
+    /// (the watcher's settle-check or the periodic-rescan filter).  When
+    /// present the worker pool will persist it via `update_file_hash` after
+    /// a successful index, so the next rescan can short-circuit.
+    pub content_sha1: Option<String>,
 }
 
 /// Scan every directory in `scan_dirs` recursively and return all PDF/AI files found.
@@ -92,6 +99,7 @@ pub fn scan_directories(scan_dirs: &[PathBuf], max_depth: u32) -> Vec<Discovered
                 file_type,
                 file_size: file_size.map(|s| s as u64),
                 modified_at,
+                content_sha1: None,
             });
         }
     }
@@ -128,6 +136,27 @@ pub fn needs_reindex(path: &Path, last_indexed_at: Option<i64>) -> bool {
         Some(mtime) => mtime > indexed_ts,
         None => false, // can't read mtime, skip
     }
+}
+
+/// Stream-hash a file's full byte content as SHA-1 hex.  Used by the
+/// re-index path to short-circuit "mtime moved but bytes are identical".
+///
+/// Reads in 1 MiB chunks so even multi-GB PDFs stay within a fixed memory
+/// budget.  Returns `None` if the file can't be opened or read (e.g. it's
+/// being held open by the writing app — the caller should treat that as
+/// "not yet stable" and retry later, not as a failure).
+pub fn hash_file_sha1(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha1::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

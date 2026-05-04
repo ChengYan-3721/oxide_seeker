@@ -263,6 +263,46 @@ async fn async_main() -> anyhow::Result<()> {
             // it into a Box -- it will be dropped when the process exits.
             Box::leak(Box::new(_watcher));
         }
+
+        // Periodic full rescan — safety net for events the OS-level watcher
+        // missed.  notify on SMB / network shares is famously unreliable, and
+        // the watcher's settle-check can also drop a file if the writing app
+        // takes longer than `watcher_max_retries * watcher_settle_secs` to
+        // finish flushing.  This loop re-runs `start_full_index`, which is
+        // cheap when nothing changed (mtime + hash short-circuits) and
+        // automatically rebuilds anything the watcher dropped.
+        let rescan_secs = config.indexer.rescan_interval_secs;
+        if rescan_secs > 0 {
+            let cfg = config.clone();
+            let p = pool.clone();
+            let v = vector_index.clone();
+            let prog = progress.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(rescan_secs));
+                tick.tick().await; // skip the immediate first tick
+                loop {
+                    tick.tick().await;
+                    if !prog.finished.load(std::sync::atomic::Ordering::Acquire) {
+                        tracing::debug!(
+                            "Periodic rescan: previous batch still running, deferring"
+                        );
+                        continue;
+                    }
+                    tracing::info!("Periodic rescan starting");
+                    if let Err(e) = indexer::start_full_index(
+                        cfg.clone(),
+                        p.clone(),
+                        v.clone(),
+                        prog.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("Periodic rescan failed: {}", e);
+                    }
+                }
+            });
+            tracing::info!("Periodic rescan enabled (every {}s)", rescan_secs);
+        }
     }
 
     // Web server

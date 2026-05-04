@@ -242,7 +242,16 @@ fn run_worker(
         let mut should_reset_counter = true;
         match subproc.process(&request) {
             Ok(ProcessResponse::Indexed { pages }) => {
-                handle_indexed(&rt, &db_pool, &index, file_id, &file.path, &pages, &progress);
+                handle_indexed(
+                    &rt,
+                    &db_pool,
+                    &index,
+                    file_id,
+                    &file.path,
+                    file.content_sha1.as_deref(),
+                    &pages,
+                    &progress,
+                );
             }
             Ok(ProcessResponse::Excluded { reason }) => {
                 if let Err(e) = rt.block_on(database::mark_file_excluded(&db_pool, file_id)) {
@@ -324,9 +333,46 @@ fn handle_indexed(
     index: &VectorIndex,
     file_id: i64,
     file_path: &std::path::Path,
+    content_sha1: Option<&str>,
     pages: &[PageData],
     progress: &IndexProgress,
 ) {
+    // ── Re-index cleanup ──────────────────────────────────────────────────
+    // BEFORE inserting any new vectors, tombstone the file's previous HNSW
+    // entries (if any) and clear its `pages` rows.  Without this step a
+    // re-indexed file would leak its old vectors into the search index
+    // (DB pages.vector_id is overwritten by the upsert, but the old HNSW
+    // points stay live and surface as orphan hits).
+    let stale_ids: Vec<i64> = match rt.block_on(database::take_existing_vector_ids(pool, file_id)) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to read existing vector ids for {}: {}",
+                file_path.display(),
+                e
+            );
+            Vec::new()
+        }
+    };
+    if !stale_ids.is_empty() {
+        let vids: Vec<u64> = stale_ids.iter().map(|v| *v as u64).collect();
+        if let Err(e) = index.remove(&vids) {
+            tracing::warn!(
+                "Failed to tombstone {} stale vectors for {}: {}",
+                vids.len(),
+                file_path.display(),
+                e
+            );
+        }
+    }
+    if let Err(e) = rt.block_on(database::delete_pages_for_file(pool, file_id)) {
+        tracing::warn!(
+            "Failed to clear stale page rows for {}: {}",
+            file_path.display(),
+            e
+        );
+    }
+
     if pages.is_empty() {
         if let Err(e) = rt.block_on(database::mark_file_indexed(pool, file_id, 0)) {
             tracing::warn!(
@@ -336,6 +382,17 @@ fn handle_indexed(
             );
             progress.failed.fetch_add(1, Ordering::Relaxed);
         } else {
+            // Empty result is still a "successful" run — persist the hash so
+            // we don't keep re-attempting an empty/zero-page document.
+            if let Some(h) = content_sha1 {
+                if let Err(e) = rt.block_on(database::update_file_hash(pool, file_id, h)) {
+                    tracing::warn!(
+                        "Failed to persist content hash for {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                }
+            }
             progress.processed.fetch_add(1, Ordering::Relaxed);
         }
         return;
@@ -376,6 +433,9 @@ fn handle_indexed(
     let outcome: Result<()> = rt.block_on(async {
         database::upsert_pages_batch(pool, file_id, &rows).await?;
         database::mark_file_indexed(pool, file_id, pages.len() as i64).await?;
+        if let Some(h) = content_sha1 {
+            database::update_file_hash(pool, file_id, h).await?;
+        }
         Ok(())
     });
 

@@ -47,6 +47,29 @@ pub struct IndexerConfig {
     /// avoid runaway recursion on pathological hierarchies (e.g. `node_modules`).
     #[serde(default = "IndexerConfig::default_max_scan_depth")]
     pub max_scan_depth: u32,
+    /// Interval (seconds) at which the watchdog re-runs `start_full_index`
+    /// to catch events the OS-level watcher missed (common on SMB / network
+    /// shares).  Set to `0` to disable.  Default: 1800 (30 min).
+    #[serde(default = "IndexerConfig::default_rescan_interval_secs")]
+    pub rescan_interval_secs: u64,
+    /// When the watcher receives a Modify event, it samples size+mtime,
+    /// waits this many seconds, then samples again.  The file is only
+    /// dispatched to the worker pool when two consecutive samples agree
+    /// (i.e. the writing application has finished flushing).  Default: 3.
+    #[serde(default = "IndexerConfig::default_watcher_settle_secs")]
+    pub watcher_settle_secs: u64,
+    /// Files smaller than this are treated as empty placeholders by the
+    /// watcher and held back until they grow.  Helps with the common
+    /// "designer saves a blank file, then fills it in" workflow without
+    /// burning a `crash_attempts` slot on the empty version.  Default: 1024.
+    #[serde(default = "IndexerConfig::default_watcher_min_bytes")]
+    pub watcher_min_bytes: u64,
+    /// Maximum number of stability re-checks a single file may undergo
+    /// before the watcher drops it from the pending queue (it'll be picked
+    /// up again on the next periodic rescan).  Default: 20 — combined with
+    /// `watcher_settle_secs=3` this gives a one-minute settling window.
+    #[serde(default = "IndexerConfig::default_watcher_max_retries")]
+    pub watcher_max_retries: u32,
 }
 
 /// Hard cap for `IndexerConfig::max_scan_depth`.  Picked at 32 because:
@@ -60,6 +83,22 @@ pub const MAX_SCAN_DEPTH_LIMIT: u32 = 32;
 impl IndexerConfig {
     fn default_max_scan_depth() -> u32 {
         3
+    }
+
+    fn default_rescan_interval_secs() -> u64 {
+        1800
+    }
+
+    fn default_watcher_settle_secs() -> u64 {
+        3
+    }
+
+    fn default_watcher_min_bytes() -> u64 {
+        1024
+    }
+
+    fn default_watcher_max_retries() -> u32 {
+        20
     }
 
     /// Return the configured depth, clamped to [`MAX_SCAN_DEPTH_LIMIT`].
@@ -156,6 +195,10 @@ impl Default for Config {
                 watch_enabled: true,
                 render_dpi: 150.0,
                 max_scan_depth: IndexerConfig::default_max_scan_depth(),
+                rescan_interval_secs: IndexerConfig::default_rescan_interval_secs(),
+                watcher_settle_secs: IndexerConfig::default_watcher_settle_secs(),
+                watcher_min_bytes: IndexerConfig::default_watcher_min_bytes(),
+                watcher_max_retries: IndexerConfig::default_watcher_max_retries(),
             },
             search: SearchConfig {
                 default_top_k: 20,

@@ -122,8 +122,52 @@ pub async fn start_full_index(
                 // File was previously excluded and hasn't been modified since;
                 // no point re-processing it — it will be excluded again.
             }
-            _ => {
-                to_index.push(file);
+            existing => {
+                // The file's mtime moved (or it's new).  Compute its content
+                // hash and short-circuit when the bytes match what we already
+                // indexed — this is the strong-idempotency layer that protects
+                // against "save with no edits" / antivirus rewrites / clock
+                // drift on network shares.
+                let hash = scanner::hash_file_sha1(&file.path);
+
+                if let (Some(rec), Some(h)) = (existing.as_ref(), hash.as_ref()) {
+                    if rec.content_sha1.as_deref() == Some(h.as_str())
+                        && rec.indexed_at.is_some()
+                    {
+                        // Bytes are identical — refresh metadata so this file
+                        // doesn't keep failing the cheap mtime check on every
+                        // rescan, and skip the worker pool.
+                        if let Err(e) = crate::storage::database::upsert_file(
+                            &pool,
+                            &file.path.to_string_lossy(),
+                            &file.filename,
+                            &file.file_type,
+                            file.file_size.map(|s| s as i64),
+                            file.modified_at,
+                        ).await {
+                            tracing::warn!(
+                                "Failed to refresh metadata for unchanged file {}: {}",
+                                file.path.display(), e
+                            );
+                        }
+                        // Bump indexed_at to suppress future mtime-based
+                        // re-triggers for this exact byte content.
+                        if let Err(e) = crate::storage::database::mark_file_indexed(
+                            &pool, rec.id, rec.page_count,
+                        ).await {
+                            tracing::warn!(
+                                "Failed to refresh indexed_at for unchanged file {}: {}",
+                                file.path.display(), e
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                to_index.push(scanner::DiscoveredFile {
+                    content_sha1: hash,
+                    ..file
+                });
             }
         }
     }

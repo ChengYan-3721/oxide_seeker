@@ -27,6 +27,11 @@ pub struct FileRecord {
     /// Free-form note describing why the file is excluded.  NULL on rows that
     /// pre-date this column.
     pub exclusion_reason: Option<String>,
+    /// SHA-1 hex digest of the file's full byte content as of the last successful
+    /// (re-)index.  NULL on rows that pre-date this column or whose hash has
+    /// never been computed.  Used by both the periodic rescan and the watcher
+    /// to short-circuit "mtime moved but bytes are identical" re-indexing.
+    pub content_sha1: Option<String>,
 }
 
 /// Page record from the `pages` table
@@ -102,6 +107,20 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool> {
 // ── File operations ───────────────────────────────────────────────────────────
 
 /// Insert or update a file record. Returns the file's `id`.
+///
+/// **Crash counter / exclusion auto-reset on content refresh.**
+/// When the row already exists *and* the new `modified_at` is strictly greater
+/// than the stored value (i.e. the user actually edited the file), we reset
+/// `crash_attempts` back to 0, clear `is_excluded`, and clear
+/// `exclusion_reason`.  This unblocks files that were previously
+/// auto-blacklisted (e.g. designer saved an empty placeholder, then later
+/// filled it in — without this reset that file would stay in the blacklist
+/// forever).
+///
+/// `indexed_at` is **not** touched here — it's still the responsibility of
+/// `mark_file_indexed` after a successful render.  This means a freshly
+/// modified file will re-enter the to-index queue on the next scan even
+/// though its row pre-existed.
 pub async fn upsert_file(
     pool: &DbPool,
     path: &str,
@@ -118,7 +137,29 @@ pub async fn upsert_file(
             filename    = excluded.filename,
             file_type   = excluded.file_type,
             file_size   = excluded.file_size,
-            modified_at = excluded.modified_at
+            modified_at = excluded.modified_at,
+            -- Reset poison-pill / blacklist state when the file actually changed.
+            crash_attempts = CASE
+                WHEN excluded.modified_at IS NOT NULL
+                 AND files.modified_at IS NOT NULL
+                 AND excluded.modified_at > files.modified_at
+                THEN 0
+                ELSE files.crash_attempts
+            END,
+            is_excluded = CASE
+                WHEN excluded.modified_at IS NOT NULL
+                 AND files.modified_at IS NOT NULL
+                 AND excluded.modified_at > files.modified_at
+                THEN 0
+                ELSE files.is_excluded
+            END,
+            exclusion_reason = CASE
+                WHEN excluded.modified_at IS NOT NULL
+                 AND files.modified_at IS NOT NULL
+                 AND excluded.modified_at > files.modified_at
+                THEN NULL
+                ELSE files.exclusion_reason
+            END
         RETURNING id
         "#,
     )
@@ -131,6 +172,50 @@ pub async fn upsert_file(
     .await?;
 
     Ok(row.get::<i64, _>("id"))
+}
+
+/// Persist `sha1_hex` as the file's last-known content fingerprint.  Called
+/// once a file has been (re-)indexed successfully so a subsequent rescan can
+/// skip the heavy work when the bytes haven't changed.
+pub async fn update_file_hash(
+    pool: &DbPool,
+    file_id: i64,
+    sha1_hex: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE files SET content_sha1 = ?2 WHERE id = ?1")
+        .bind(file_id)
+        .bind(sha1_hex)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Drain the `vector_id`s currently attached to `file_id`, returning them so
+/// the caller can tombstone the corresponding HNSW entries before inserting
+/// new ones.  This is the missing half of the re-index flow: without it, a
+/// modified file would leak its old vectors into the search index forever.
+pub async fn take_existing_vector_ids(
+    pool: &DbPool,
+    file_id: i64,
+) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT vector_id FROM pages WHERE file_id = ?1 AND vector_id IS NOT NULL",
+    )
+    .bind(file_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
+/// Delete every `pages` row belonging to `file_id`.  Called on the re-index
+/// path so a file that shrank (e.g. 10 pages → 5) doesn't leave orphan rows
+/// pointing at stale vector ids.
+pub async fn delete_pages_for_file(pool: &DbPool, file_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM pages WHERE file_id = ?1")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Mark a file as excluded (imposition/layout file).

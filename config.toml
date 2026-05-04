@@ -5,11 +5,15 @@ batch_size = 8
 render_dpi = 150.0
 watch_enabled = true
 worker_threads = 8
-max_scan_depth = 3
+max_scan_depth = 3            # 扫描递归层数
+rescan_interval_secs = 1800   # 0 关闭定时重扫
+watcher_settle_secs  = 3      # 稳定性采样间隔
+watcher_min_bytes    = 1024   # 小于此值视为占位文件
+watcher_max_retries  = 20     # 不稳定文件最多等 60s
 
 [paths]
-data_dir = "C:/OxideSeeker/data"
-model_path = "C:/OxideSeeker/models/clip_visual.onnx"
+data_dir = "./data"
+model_path = "./clip_visual.onnx"
 scan_dirs = []
 
 [search]
