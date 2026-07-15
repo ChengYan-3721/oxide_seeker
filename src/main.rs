@@ -9,9 +9,11 @@ mod config;
 mod crash_handler;
 mod embedder;
 mod error;
+mod evaluate;
 mod indexer;
 #[cfg(windows)]
 mod job_object;
+mod ocr;
 mod search;
 mod storage;
 mod license;
@@ -20,8 +22,8 @@ mod worker_proc;
 
 use crate::{
     config::Config,
-    embedder::clip::ClipEmbedder,
-    search::{SearchEngine, VectorIndex},
+    embedder::vision::VisionEmbedder,
+    search::{PhashStore, SearchEngine, VectorIndex},
     storage::{
         database,
         thumbnail::ThumbnailStore,
@@ -69,6 +71,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
         return worker_proc::run();
+    }
+
+    // Offline evaluation harness: measures retrieval quality against
+    // synthetic queries cut from the indexed corpus.  Runs the search stack
+    // only — no indexer, watcher, web server, or single-instance lock (it is
+    // expected to run alongside a live service instance).  CWD is left
+    // untouched so `--config`/`--out` resolve relative to the caller's shell.
+    if std::env::args().any(|a| a == "--evaluate") {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(evaluate::run());
     }
 
     // Build a multi-thread tokio runtime by hand so the worker-mode early
@@ -191,36 +205,66 @@ async fn async_main() -> anyhow::Result<()> {
     let license_state = license::evaluate_and_persist(&pool).await?;
     tracing::info!("License status: {} - {}", license_state.status, license_state.message);
 
-    // Vector index
+    // Vector index (HNSW dump; rebuilt from DB below if missing/lagging)
     let vector_index = VectorIndex::open(&config.vector_index_path())?;
 
-    // CLIP model
-    let clip = match ClipEmbedder::load(&config.paths.model_path) {
+    // Rebuild the ANN graph from the vectors persisted in SQLite when the
+    // dump is missing or clearly behind the DB (corruption, deleted files,
+    // tombstone compaction).  Streams blobs — no model inference involved.
+    search::rebuild_index_if_needed(&pool, &vector_index).await?;
+
+    // In-memory pHash table (one u64 per region, scanned with rayon)
+    let phash_store = Arc::new(PhashStore::new());
+    phash_store.replace_all(database::load_phash_entries(&pool).await?);
+
+    // Vision encoder model
+    let embedder = match VisionEmbedder::load(&config.paths.model_path) {
         Ok(c) => {
-            tracing::info!("CLIP model loaded from {}", config.paths.model_path.display());
+            tracing::info!("Vision model loaded from {}", config.paths.model_path.display());
             Arc::new(c)
         }
         Err(e) => {
             tracing::warn!(
-                "CLIP model not available ({}). Vector search disabled. \
-                 Only pHash search will work until the model is placed at: {}",
+                "Vision model not available ({}). \
+                 Place the exported model at: {}",
                 e,
                 config.paths.model_path.display()
             );
-            // Proceed without CLIP -- pHash-only mode
-            // For a production deployment this should be a hard error.
-            // Here we allow startup so the operator can place the model file.
             return Err(e.into());
+        }
+    };
+
+    // Query-side OCR engine — optional: absent models degrade to
+    // visual-only search with a warning.
+    let ocr_engine = match ocr::OcrEngine::load(
+        &config.paths.ocr_det_path,
+        &config.paths.ocr_rec_path,
+    ) {
+        Ok(e) => {
+            tracing::info!("OCR text channel enabled");
+            Some(Arc::new(parking_lot::Mutex::new(e)))
+        }
+        Err(e) => {
+            tracing::warn!("OCR text channel disabled ({}).", e);
+            None
         }
     };
 
     // Search engine
     let engine = SearchEngine::new(
         pool.clone(),
-        &clip,
+        &embedder,
+        ocr_engine.clone(),
         vector_index.clone(),
+        phash_store.clone(),
         config.search.clone(),
     )?;
+
+    // Background OCR backfill: renders + recognises pages missing a
+    // page_ocr row.  No-op (with a warning) when the models are absent.
+    if ocr_engine.is_some() {
+        indexer::ocr_backfill::spawn(config.clone(), pool.clone());
+    }
 
     // Create the shared progress tracker BEFORE starting the indexer so that
     // the exact same Arc is passed to both the indexer worker pool and the
@@ -239,6 +283,7 @@ async fn async_main() -> anyhow::Result<()> {
             config.clone(),
             pool.clone(),
             vector_index.clone(),
+            phash_store.clone(),
             progress.clone(),
         )
         .await?;
@@ -254,6 +299,7 @@ async fn async_main() -> anyhow::Result<()> {
                 config.clone(),
                 pool.clone(),
                 vector_index.clone(),
+                phash_store.clone(),
             )
             .await?;
 
@@ -276,6 +322,7 @@ async fn async_main() -> anyhow::Result<()> {
             let cfg = config.clone();
             let p = pool.clone();
             let v = vector_index.clone();
+            let ph = phash_store.clone();
             let prog = progress.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(rescan_secs));
@@ -293,6 +340,7 @@ async fn async_main() -> anyhow::Result<()> {
                         cfg.clone(),
                         p.clone(),
                         v.clone(),
+                        ph.clone(),
                         prog.clone(),
                     )
                     .await
@@ -316,8 +364,9 @@ async fn async_main() -> anyhow::Result<()> {
         progress,
         &thumbnails_dir,
         config_path,
-        clip,
+        embedder,
         vector_index,
+        phash_store,
         thumb_store,
     );
 

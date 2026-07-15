@@ -6,9 +6,9 @@ pub mod ws_handler;
 use crate::{
     config::Config,
     indexer::IndexProgress,
-    search::{SearchEngine, vector_index::VectorIndex},
+    search::{PhashStore, SearchEngine, vector_index::VectorIndex},
     storage::{database::DbPool, thumbnail::ThumbnailStore},
-    embedder::clip::ClipEmbedder,
+    embedder::vision::VisionEmbedder,
    web::{
        handlers::{
            get_config, get_license_status, index_status, search_clipboard, search_upload,
@@ -31,14 +31,16 @@ use tower_http::{
 };
 
 /// Build the Axum application router with all routes configured.
+#[allow(clippy::too_many_arguments)]
 pub fn build_router(
     engine: SearchEngine,
     pool: DbPool,
     progress: Arc<IndexProgress>,
     thumbnails_dir: &Path,
     config_path: std::path::PathBuf,
-    clip: Arc<ClipEmbedder>,
+    embedder: Arc<VisionEmbedder>,
     vector_index: Arc<VectorIndex>,
+    phash_store: Arc<PhashStore>,
     thumb_store: Arc<ThumbnailStore>,
 ) -> Router {
     let app_state = AppState {
@@ -46,8 +48,9 @@ pub fn build_router(
         pool: pool.clone(),
         progress: progress.clone(),
         config_path,
-        clip,
+        embedder,
         vector_index,
+        phash_store,
         thumb_store,
     };
 
@@ -70,7 +73,9 @@ pub fn build_router(
        .route("/api/config", get(get_config).post(update_config))
        .route("/api/license", get(get_license_status).post(update_license))
         .with_state(app_state)
-        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
+        // Body limit shares the handler's byte cap so the two never drift;
+        // the multipart handler still returns a clean 413 at the same size.
+        .layer(DefaultBodyLimit::max(handlers::MAX_UPLOAD_BYTES))
         // WebSocket route (different state type)
         .route("/ws/progress", get(ws_handler))
         .with_state(ws_state)

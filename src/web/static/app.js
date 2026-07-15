@@ -120,6 +120,40 @@ function getMappedPath(originalPath) {
 
 
 // ── Image selection ───────────────────────────────────────────────────────────
+
+// 上传前在浏览器端把过大的图片缩到长边 UPLOAD_MAX_EDGE。多数手机照片/高分屏
+// 截图都远超搜索所需的分辨率（后端 letterbox 到 224、OCR 检测上限 1280），
+// 客户端预缩既省带宽，也避免触碰后端上传上限导致的失败。缩放失败时回退到
+// 原文件，由后端兜底处理。
+const UPLOAD_MAX_EDGE = 2048;
+
+async function downscaleForUpload(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const longEdge = Math.max(bitmap.width, bitmap.height);
+    if (longEdge <= UPLOAD_MAX_EDGE) {
+      bitmap.close?.();
+      return file; // 已足够小，原样上传
+    }
+    const scale = UPLOAD_MAX_EDGE / longEdge;
+    const w = Math.round(bitmap.width * scale);
+    const h = Math.round(bitmap.height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+    bitmap.close?.();
+    const blob = await new Promise((res) =>
+      canvas.toBlob(res, 'image/jpeg', 0.9)
+    );
+    if (!blob) return file;
+    return new File([blob], 'query.jpg', { type: 'image/jpeg' });
+  } catch (e) {
+    console.warn('客户端压缩失败，改为上传原图', e);
+    return file;
+  }
+}
+
 function setImage(file) {
  if (!file || !file.type.startsWith('image/')) {
    alert('请选择有效的图片文件（PNG、JPEG 或 WebP）');
@@ -211,7 +245,7 @@ async function runSearch() {
 
   try {
     const form = new FormData();
-    form.append('image', selectedFile);
+    form.append('image', await downscaleForUpload(selectedFile));
     form.append('top_k', String(topK));
 
     const resp = await fetch('/api/search', {method: 'POST', body: form});

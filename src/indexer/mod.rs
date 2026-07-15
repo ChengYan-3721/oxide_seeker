@@ -1,6 +1,7 @@
 //! Indexing subsystem: scan -> filter -> render -> embed -> store.
 
 pub mod filter;
+pub mod ocr_backfill;
 pub mod pdf_processor;
 pub mod scanner;
 pub mod subprocess;
@@ -12,7 +13,7 @@ pub use worker_pool::IndexProgress;
 use crate::{
     config::Config,
     error::Result,
-    search::vector_index::VectorIndex,
+    search::{phash_store::PhashStore, vector_index::VectorIndex},
     storage::database::DbPool,
 };
 use std::sync::Arc;
@@ -27,14 +28,15 @@ use std::sync::Arc;
 /// handler so both share the same live counters.  The total is updated here
 /// once the file list is known.
 ///
-/// PDF rendering and CLIP inference run in worker subprocesses (see
-/// [`subprocess::WorkerProcess`]), so the parent never needs a `ClipEmbedder`
+/// PDF rendering and encoder inference run in worker subprocesses (see
+/// [`subprocess::WorkerProcess`]), so the parent never needs an embedder
 /// or `ThumbnailStore` of its own — the model path and thumbnails dir come
 /// straight out of `config`.
 pub async fn start_full_index(
     config: Arc<Config>,
     pool: DbPool,
     index: Arc<VectorIndex>,
+    phash_store: Arc<PhashStore>,
     progress: Arc<IndexProgress>,
 ) -> Result<()> {
     // 1. Scan directories
@@ -55,25 +57,24 @@ pub async fn start_full_index(
     for db_path in db_files {
         if !discovered_paths.contains(&db_path) {
             tracing::info!("File removed from disk, cleaning index: {}", db_path);
-            let vector_ids = crate::storage::database::delete_file_by_path(&pool, &db_path).await?;
-            if !vector_ids.is_empty() {
-                let vids: Vec<u64> = vector_ids.into_iter().map(|v| v as u64).collect();
+            let region_ids = crate::storage::database::delete_file_by_path(&pool, &db_path).await?;
+            if !region_ids.is_empty() {
+                let vids: Vec<u64> = region_ids.iter().map(|v| *v as u64).collect();
                 if let Err(e) = index.remove(&vids) {
                     tracing::warn!("Failed to remove stale vectors for {}: {}", db_path, e);
                 }
+                phash_store.remove(&region_ids);
             }
         }
     }
 
-    // If stale entries were removed, save and trigger a background rebuild
-    // so that searches don't pay the rebuild cost later.
+    // Persist the tombstones added during stale cleanup.
     {
         let idx = index.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = idx.save() {
                 tracing::warn!("Failed to save vector index after stale cleanup: {}", e);
             }
-            idx.trigger_rebuild();
         })
         .await
         .ok();
@@ -87,14 +88,41 @@ pub async fn start_full_index(
     // skipped and why.
     const CRASH_ATTEMPT_THRESHOLD: i64 = 2;
 
+    // Bulk-load every existing files-table row in a single query.  A scan
+    // that finds 300k files would otherwise issue 300k async SQLite queries
+    // here — each cheap individually, but their cumulative latency makes the
+    // CLI look frozen for many minutes between "Scan complete" and the first
+    // worker-pool log line.  In-memory map lookups are O(1) and microsecond-
+    // scale.
+    let known_records = crate::storage::database::get_all_file_records(&pool).await?;
+    let known_by_path: std::collections::HashMap<String, crate::storage::database::FileRecord> =
+        known_records
+            .into_iter()
+            .map(|r| (r.path.clone(), r))
+            .collect();
+    tracing::info!(
+        "Loaded {} existing file records for filter stage",
+        known_by_path.len()
+    );
+
     let mut to_index = Vec::new();
+    let total_to_filter = all_files.len();
+    let mut scanned = 0usize;
+    let mut hashed = 0usize;
     for file in all_files {
-        match crate::storage::database::get_file_by_path(
-            &pool,
-            &file.path.to_string_lossy(),
-        )
-        .await?
-        {
+        scanned += 1;
+        if scanned % 10_000 == 0 {
+            tracing::info!(
+                "Filter progress: {}/{} scanned, {} queued, {} byte-hashed",
+                scanned,
+                total_to_filter,
+                to_index.len(),
+                hashed
+            );
+        }
+
+        let path_str = file.path.to_string_lossy().into_owned();
+        match known_by_path.get(&path_str) {
             Some(rec) if rec.crash_attempts >= CRASH_ATTEMPT_THRESHOLD => {
                 if rec.is_excluded == 0 {
                     let reason = format!(
@@ -118,19 +146,21 @@ pub async fn start_full_index(
             Some(rec) if !scanner::needs_reindex(&file.path, rec.indexed_at) => {
                 // File is up-to-date; skip
             }
-            Some(rec) if rec.is_excluded == 1 && !scanner::needs_reindex(&file.path, rec.modified_at) => {
+            Some(rec)
+                if rec.is_excluded == 1
+                    && !scanner::needs_reindex(&file.path, rec.modified_at) =>
+            {
                 // File was previously excluded and hasn't been modified since;
                 // no point re-processing it — it will be excluded again.
             }
-            existing => {
-                // The file's mtime moved (or it's new).  Compute its content
-                // hash and short-circuit when the bytes match what we already
-                // indexed — this is the strong-idempotency layer that protects
-                // against "save with no edits" / antivirus rewrites / clock
-                // drift on network shares.
+            Some(rec) => {
+                // The file has a row AND its mtime moved.  Compute the
+                // content hash so we can short-circuit "mtime moved but
+                // bytes are identical" — the bulk of cases for design files
+                // re-saved through Illustrator without real edits.
+                hashed += 1;
                 let hash = scanner::hash_file_sha1(&file.path);
-
-                if let (Some(rec), Some(h)) = (existing.as_ref(), hash.as_ref()) {
+                if let Some(h) = hash.as_ref() {
                     if rec.content_sha1.as_deref() == Some(h.as_str())
                         && rec.indexed_at.is_some()
                     {
@@ -139,40 +169,57 @@ pub async fn start_full_index(
                         // rescan, and skip the worker pool.
                         if let Err(e) = crate::storage::database::upsert_file(
                             &pool,
-                            &file.path.to_string_lossy(),
+                            &path_str,
                             &file.filename,
                             &file.file_type,
                             file.file_size.map(|s| s as i64),
                             file.modified_at,
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::warn!(
                                 "Failed to refresh metadata for unchanged file {}: {}",
-                                file.path.display(), e
+                                file.path.display(),
+                                e
                             );
                         }
-                        // Bump indexed_at to suppress future mtime-based
-                        // re-triggers for this exact byte content.
                         if let Err(e) = crate::storage::database::mark_file_indexed(
-                            &pool, rec.id, rec.page_count,
-                        ).await {
+                            &pool,
+                            rec.id,
+                            rec.page_count,
+                        )
+                        .await
+                        {
                             tracing::warn!(
                                 "Failed to refresh indexed_at for unchanged file {}: {}",
-                                file.path.display(), e
+                                file.path.display(),
+                                e
                             );
                         }
                         continue;
                     }
                 }
-
                 to_index.push(scanner::DiscoveredFile {
                     content_sha1: hash,
                     ..file
                 });
             }
+            None => {
+                // Brand-new file — no prior row, so a content hash would
+                // have nothing to compare against.  Skip the SHA-1 (which
+                // would cost a full sequential read of every file on disk —
+                // hours on a 300k-file network share) and let the worker
+                // pool compute it on first index instead.
+                to_index.push(file);
+            }
         }
     }
 
-    tracing::info!("{} files queued for indexing", to_index.len());
+    tracing::info!(
+        "Filter complete: {} files queued for indexing ({} byte-hashed during filter)",
+        to_index.len(),
+        hashed
+    );
 
     // Update the shared progress total now that we know how many files there are
     progress.total.store(to_index.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -180,7 +227,7 @@ pub async fn start_full_index(
 
     // 3. Run the worker pool in a blocking task (CPU-intensive)
     tokio::task::spawn_blocking(move || {
-        worker_pool::run_batch(to_index, pool, index, config, progress_clone);
+        worker_pool::run_batch(to_index, pool, index, phash_store, config, progress_clone);
     });
 
     Ok(())

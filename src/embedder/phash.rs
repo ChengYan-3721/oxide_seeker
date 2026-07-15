@@ -1,42 +1,34 @@
 //! Perceptual hash (pHash) computation for images.
 //!
-//! Uses the `image-hasher` crate with the DCT-based pHash algorithm.
-//! The hash is stored as a 16-character lowercase hex string (64 bits).
+//! Uses the `image-hasher` crate with the DoubleGradient algorithm at
+//! 8×8 = 64 bits.  Hashes are handled as raw `u64` throughout — SQLite stores
+//! them as a bit-cast `i64` and the in-memory pHash store scans them with
+//! XOR + popcount, so no hex round-trips exist anywhere on the hot path.
 
-use crate::error::{AppError, Result};
 use image::DynamicImage;
-use image_hasher::{HashAlg, HasherConfig, ImageHash};
+use image_hasher::{HashAlg, HasherConfig};
 
-/// Compute the pHash of an image and return it as a 16-character hex string.
-pub fn compute_phash(img: &DynamicImage) -> String {
+/// Compute the 64-bit pHash of an image.
+pub fn compute_phash(img: &DynamicImage) -> u64 {
     let hasher = HasherConfig::new()
         .hash_alg(HashAlg::DoubleGradient)
         .hash_size(8, 8) // 8×8 = 64 bits
         .to_hasher();
 
     let hash = hasher.hash_image(img);
-    hash_to_hex(&hash)
+    let bytes = hash.as_bytes();
+    // DoubleGradient at 8×8 yields exactly 8 bytes; be defensive anyway.
+    let mut buf = [0u8; 8];
+    for (i, b) in bytes.iter().take(8).enumerate() {
+        buf[i] = *b;
+    }
+    u64::from_le_bytes(buf)
 }
 
-/// Decode a hex pHash string back to an `ImageHash`.
-pub fn hex_to_hash(hex: &str) -> Result<ImageHash<Box<[u8]>>> {
-    let bytes = hex::decode(hex)
-        .map_err(|e| AppError::Search(format!("Invalid pHash hex '{}': {}", hex, e)))?;
-    Ok(ImageHash::from_bytes(&bytes)
-        .map_err(|e| AppError::Search(format!("Cannot decode pHash bytes: {:?}", e)))?)
-}
-
-/// Encode an `ImageHash` to its hex representation.
-pub fn hash_to_hex(hash: &ImageHash<Box<[u8]>>) -> String {
-    hex::encode(hash.as_bytes())
-}
-
-/// Compute the Hamming distance between two pHash hex strings.
-/// Returns `None` if either string is malformed.
-pub fn hamming_distance(a: &str, b: &str) -> Option<u32> {
-    let ha = hex_to_hash(a).ok()?;
-    let hb = hex_to_hash(b).ok()?;
-    Some(ha.dist(&hb))
+/// Hamming distance between two 64-bit pHashes.
+#[inline]
+pub fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
 }
 
 #[cfg(test)]
@@ -52,30 +44,25 @@ mod tests {
     #[test]
     fn same_image_zero_distance() {
         let img = solid_image(128, 64, 32);
-        let h1 = compute_phash(&img);
-        let h2 = compute_phash(&img);
-        assert_eq!(hamming_distance(&h1, &h2), Some(0));
+        assert_eq!(hamming_distance(compute_phash(&img), compute_phash(&img)), 0);
     }
 
     #[test]
-    fn very_different_images_large_distance() {
-        let black = solid_image(0, 0, 0);
-        let white = solid_image(255, 255, 255);
-        let h_black = compute_phash(&black);
-        let h_white = compute_phash(&white);
-        let dist = hamming_distance(&h_black, &h_white).unwrap();
-        // Black and white solid images should have a non-zero distance
-        // (exact value depends on algorithm, but should be > 0)
-        assert!(dist > 0, "Expected non-zero distance, got {}", dist);
+    fn gradient_images_nonzero_distance() {
+        let a = DynamicImage::ImageRgb8(RgbImage::from_fn(64, 64, |x, _| {
+            image::Rgb([(x * 4) as u8, 0, 0])
+        }));
+        let b = DynamicImage::ImageRgb8(RgbImage::from_fn(64, 64, |_, y| {
+            image::Rgb([0, (y * 4) as u8, 0])
+        }));
+        assert!(hamming_distance(compute_phash(&a), compute_phash(&b)) > 0);
     }
 
     #[test]
-    fn hex_roundtrip() {
-        let img = solid_image(100, 150, 200);
-        let hex = compute_phash(&img);
-        assert_eq!(hex.len(), 16, "pHash hex should be 16 chars (64 bits)");
-        // Roundtrip decode
-        let decoded = hex_to_hash(&hex).expect("Should decode");
-        assert_eq!(hash_to_hex(&decoded), hex);
+    fn db_bitcast_roundtrip_preserves_high_bit() {
+        // regions.phash stores the u64 bit-cast to SQLite's signed i64;
+        // make sure hashes with the sign bit set survive the round-trip.
+        let h: u64 = 0xFFFF_0000_DEAD_BEEF;
+        assert_eq!((h as i64) as u64, h);
     }
 }

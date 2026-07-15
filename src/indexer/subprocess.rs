@@ -35,9 +35,36 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 pub struct WorkerInit {
     pub model_path: PathBuf,
     pub thumbnails_dir: PathBuf,
+    /// PP-OCR model paths; loaded lazily on the first [`WorkerRequest::OcrPage`].
+    pub ocr_det_path: PathBuf,
+    pub ocr_rec_path: PathBuf,
     /// Used purely for logging on the child side so log lines from different
     /// workers can be told apart.
     pub worker_idx: usize,
+    /// When `true`, each page additionally emits 9 overlapping tiles
+    /// (size = ½ page, stride = ¼ page).  See `IndexerConfig::tiles_enabled`.
+    pub tiles_enabled: bool,
+}
+
+/// One unit of work for the child.  Every variant is watchdog-protected on
+/// the child side: an FFI call that neither returns nor crashes (observed
+/// with pdfium on a poison page at OCR resolution) makes the child
+/// `exit(3)` after a deadline, which the parent sees as a broken pipe and
+/// handles like any crash — respawn and move on.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum WorkerRequest {
+    /// Render + embed + pHash a whole file (the indexing pipeline).
+    Index(ProcessRequest),
+    /// Render one page at OCR resolution and extract its text.
+    OcrPage { file_path: PathBuf, page_num: i64 },
+}
+
+/// Response for a [`WorkerRequest`], same order.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum WorkerResponse {
+    Index(ProcessResponse),
+    /// Extracted text ("" when the page has none / OCR failed softly).
+    OcrPage { text: String },
 }
 
 /// One file the parent wants processed.
@@ -68,12 +95,54 @@ pub struct PageData {
     pub page_num: i32,
     pub width_px: u32,
     pub height_px: u32,
-    pub phash: String,
-    pub vector: Vec<f32>,
     /// Path of the saved thumbnail relative to the thumbnails dir.  Child
     /// writes the file directly to disk so the parent does not have to ship
     /// thumbnail bytes back through the pipe.
     pub thumb_relative_path: String,
+    /// Per-region embeddings.  Always at least one entry — the full-page
+    /// region — followed by 9 overlapping tiles when tiles are enabled.
+    /// The parent persists one `regions` row per entry.
+    pub regions: Vec<RegionData>,
+}
+
+/// Sub-region of a page that gets its own pHash + embedding.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RegionData {
+    pub kind: RegionKind,
+    /// Row-major position within the tile grid (0 for full-page rows).
+    pub index: u32,
+    /// Normalised bbox in page coordinates (`x`, `y`, `w`, `h`, all in
+    /// `[0, 1]`).  The full-page region is `(0, 0, 1, 1)`.
+    pub bbox: RegionBBox,
+    /// 64-bit perceptual hash of this region's pixels.
+    pub phash: u64,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionKind {
+    /// Whole-page embedding.  Always present.
+    Full,
+    /// One of the 9 overlapping tiles (size = ½ page, stride = ¼ page).
+    Tile,
+}
+
+impl RegionKind {
+    /// Lower-case string used in the `regions.kind` SQL column.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            RegionKind::Full => "full",
+            RegionKind::Tile => "tile",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct RegionBBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 // ── Framing helpers ──────────────────────────────────────────────────────────
@@ -129,7 +198,14 @@ pub struct WorkerProcess {
 impl WorkerProcess {
     /// Spawn `oxide_seeker --worker-mode` and send the `WorkerInit` frame.
     /// The returned handle is ready to call [`process`](Self::process).
-    pub fn spawn(model_path: &Path, thumbnails_dir: &Path, worker_idx: usize) -> Result<Self> {
+    pub fn spawn(
+        model_path: &Path,
+        thumbnails_dir: &Path,
+        ocr_det_path: &Path,
+        ocr_rec_path: &Path,
+        worker_idx: usize,
+        tiles_enabled: bool,
+    ) -> Result<Self> {
         // Re-exec the same binary so deployment stays a single file.
         let exe = std::env::current_exe().map_err(AppError::Io)?;
 
@@ -183,23 +259,60 @@ impl WorkerProcess {
         let init = WorkerInit {
             model_path: model_path.to_path_buf(),
             thumbnails_dir: thumbnails_dir.to_path_buf(),
+            ocr_det_path: ocr_det_path.to_path_buf(),
+            ocr_rec_path: ocr_rec_path.to_path_buf(),
             worker_idx,
+            tiles_enabled,
         };
         write_frame(&mut wp.stdin, &init)?;
         Ok(wp)
     }
 
-    /// Send one request and wait for the matching response.  Errors here
-    /// indicate the subprocess died (broken pipe / EOF) and the parent
-    /// should respawn.
+    /// Send one indexing request and wait for the matching response.  Errors
+    /// here indicate the subprocess died (broken pipe / EOF / watchdog
+    /// exit) and the parent should respawn.
     pub fn process(&mut self, req: &ProcessRequest) -> Result<ProcessResponse> {
-        write_frame(&mut self.stdin, req)?;
-        let resp: Option<ProcessResponse> = read_frame(&mut self.stdout)?;
-        resp.ok_or_else(|| {
-            AppError::Other(anyhow::anyhow!(
+        write_frame(
+            &mut self.stdin,
+            &WorkerRequest::Index(ProcessRequest {
+                file_path: req.file_path.clone(),
+                file_id: req.file_id,
+            }),
+        )?;
+        let resp: Option<WorkerResponse> = read_frame(&mut self.stdout)?;
+        match resp {
+            Some(WorkerResponse::Index(r)) => Ok(r),
+            Some(other) => Err(AppError::Other(anyhow::anyhow!(
+                "worker returned mismatched response type: {:?}",
+                other
+            ))),
+            None => Err(AppError::Other(anyhow::anyhow!(
                 "worker subprocess closed pipe without responding"
-            ))
-        })
+            ))),
+        }
+    }
+
+    /// Send one OCR request and wait for the text.  Same failure semantics
+    /// as [`process`](Self::process).
+    pub fn process_ocr(&mut self, file_path: &Path, page_num: i64) -> Result<String> {
+        write_frame(
+            &mut self.stdin,
+            &WorkerRequest::OcrPage {
+                file_path: file_path.to_path_buf(),
+                page_num,
+            },
+        )?;
+        let resp: Option<WorkerResponse> = read_frame(&mut self.stdout)?;
+        match resp {
+            Some(WorkerResponse::OcrPage { text }) => Ok(text),
+            Some(other) => Err(AppError::Other(anyhow::anyhow!(
+                "worker returned mismatched response type: {:?}",
+                other
+            ))),
+            None => Err(AppError::Other(anyhow::anyhow!(
+                "worker subprocess closed pipe without responding"
+            ))),
+        }
     }
 }
 

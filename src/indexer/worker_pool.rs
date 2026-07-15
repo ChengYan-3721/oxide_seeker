@@ -27,8 +27,11 @@ use crate::{
         scanner::DiscoveredFile,
         subprocess::{PageData, ProcessRequest, ProcessResponse, WorkerProcess},
     },
-    search::vector_index::{VectorId, VectorIndex},
-    storage::database::{self, DbPool, PageUpsert},
+    search::{
+        phash_store::PhashStore,
+        vector_index::{VectorId, VectorIndex},
+    },
+    storage::database::{self, DbPool, NewPage, NewRegion},
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::PathBuf;
@@ -80,6 +83,7 @@ pub fn run_batch(
     files: Vec<DiscoveredFile>,
     pool: DbPool,
     index: Arc<VectorIndex>,
+    phash_store: Arc<PhashStore>,
     config: Arc<Config>,
     progress: Arc<IndexProgress>,
 ) {
@@ -112,15 +116,21 @@ pub fn run_batch(
 
     let model_path = config.paths.model_path.clone();
     let thumbnails_dir = config.thumbnails_dir();
+    let ocr_det_path = config.paths.ocr_det_path.clone();
+    let ocr_rec_path = config.paths.ocr_rec_path.clone();
+    let tiles_enabled = config.indexer.tiles_enabled;
 
     pool_rayon.scope(|scope| {
         for worker_idx in 0..num_threads {
             let rx = rx.clone();
             let db_pool = pool.clone();
             let index = index.clone();
+            let phash_store = phash_store.clone();
             let progress = progress.clone();
             let model_path = model_path.clone();
             let thumbnails_dir = thumbnails_dir.clone();
+            let ocr_det_path = ocr_det_path.clone();
+            let ocr_rec_path = ocr_rec_path.clone();
 
             scope.spawn(move |_| {
                 run_worker(
@@ -128,9 +138,13 @@ pub fn run_batch(
                     rx,
                     db_pool,
                     index,
+                    phash_store,
                     progress,
                     model_path,
                     thumbnails_dir,
+                    ocr_det_path,
+                    ocr_rec_path,
+                    tiles_enabled,
                     n,
                 );
             });
@@ -173,9 +187,13 @@ fn run_worker(
     rx: Receiver<DiscoveredFile>,
     db_pool: DbPool,
     index: Arc<VectorIndex>,
+    phash_store: Arc<PhashStore>,
     progress: Arc<IndexProgress>,
     model_path: PathBuf,
     thumbnails_dir: PathBuf,
+    ocr_det_path: PathBuf,
+    ocr_rec_path: PathBuf,
+    tiles_enabled: bool,
     total_files: usize,
 ) {
     // Single-threaded tokio runtime per worker for async DB calls.
@@ -184,7 +202,17 @@ fn run_worker(
         .build()
         .expect("Worker tokio runtime");
 
-    let mut subproc = match WorkerProcess::spawn(&model_path, &thumbnails_dir, worker_idx) {
+    let spawn_worker = || {
+        WorkerProcess::spawn(
+            &model_path,
+            &thumbnails_dir,
+            &ocr_det_path,
+            &ocr_rec_path,
+            worker_idx,
+            tiles_enabled,
+        )
+    };
+    let mut subproc = match spawn_worker() {
         Ok(w) => w,
         Err(e) => {
             tracing::error!(
@@ -246,6 +274,7 @@ fn run_worker(
                     &rt,
                     &db_pool,
                     &index,
+                    &phash_store,
                     file_id,
                     &file.path,
                     file.content_sha1.as_deref(),
@@ -285,7 +314,7 @@ fn run_worker(
                 progress.failed.fetch_add(1, Ordering::Relaxed);
                 should_reset_counter = false;
 
-                subproc = match WorkerProcess::spawn(&model_path, &thumbnails_dir, worker_idx) {
+                subproc = match spawn_worker() {
                     Ok(w) => w,
                     Err(spawn_err) => {
                         tracing::error!(
@@ -327,10 +356,12 @@ fn run_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_indexed(
     rt: &tokio::runtime::Runtime,
     pool: &DbPool,
     index: &VectorIndex,
+    phash_store: &PhashStore,
     file_id: i64,
     file_path: &std::path::Path,
     content_sha1: Option<&str>,
@@ -338,16 +369,15 @@ fn handle_indexed(
     progress: &IndexProgress,
 ) {
     // ── Re-index cleanup ──────────────────────────────────────────────────
-    // BEFORE inserting any new vectors, tombstone the file's previous HNSW
-    // entries (if any) and clear its `pages` rows.  Without this step a
-    // re-indexed file would leak its old vectors into the search index
-    // (DB pages.vector_id is overwritten by the upsert, but the old HNSW
-    // points stay live and surface as orphan hits).
-    let stale_ids: Vec<i64> = match rt.block_on(database::take_existing_vector_ids(pool, file_id)) {
+    // BEFORE inserting new rows, tombstone the file's previous ANN entries
+    // and evict its pHash-store entries, then clear its pages/regions rows.
+    // Without this a re-indexed file would leak its old vectors into the
+    // search index as orphan hits.
+    let stale_ids: Vec<i64> = match rt.block_on(database::get_region_ids_for_file(pool, file_id)) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
-                "Failed to read existing vector ids for {}: {}",
+                "Failed to read existing region ids for {}: {}",
                 file_path.display(),
                 e
             );
@@ -364,6 +394,7 @@ fn handle_indexed(
                 e
             );
         }
+        phash_store.remove(&stale_ids);
     }
     if let Err(e) = rt.block_on(database::delete_pages_for_file(pool, file_id)) {
         tracing::warn!(
@@ -398,56 +429,43 @@ fn handle_indexed(
         return;
     }
 
-    // Allocate HNSW ids and insert the whole batch.
-    let vector_ids: Vec<VectorId> = (0..pages.len()).map(|_| index.next_id()).collect();
-    let vec_batch: Vec<(VectorId, Vec<f32>)> = vector_ids
+    // ── Persist pages + regions (vector BLOBs included) in one transaction ─
+    // The DB commit happens FIRST; region ids come back from AUTOINCREMENT
+    // and double as ANN / pHash-store ids.  If the process dies after the
+    // commit but before the in-memory inserts below, the startup rebuild
+    // path restores both stores from the DB — no dangling state is possible.
+    let new_pages: Vec<NewPage> = pages
         .iter()
-        .zip(pages.iter())
-        .map(|(id, p)| (*id, p.vector.clone()))
-        .collect();
-
-    if let Err(e) = index.add_batch(&vec_batch) {
-        tracing::warn!(
-            "HNSW insert failed for {}: {}",
-            file_path.display(),
-            e
-        );
-        progress.failed.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    // Persist page rows in a single transaction.
-    let rows: Vec<PageUpsert<'_>> = pages
-        .iter()
-        .enumerate()
-        .map(|(i, p)| PageUpsert {
-            page_num: p.page_num as i64,
-            phash: Some(p.phash.as_str()),
-            vector_id: Some(vector_ids[i] as i64),
-            thumb_path: Some(p.thumb_relative_path.as_str()),
-            width_px: Some(p.width_px as i64),
-            height_px: Some(p.height_px as i64),
+        .map(|page| NewPage {
+            page_num: page.page_num as i64,
+            width_px: page.width_px as i64,
+            height_px: page.height_px as i64,
+            thumb_path: page.thumb_relative_path.clone(),
+            regions: page
+                .regions
+                .iter()
+                .map(|r| NewRegion {
+                    kind: r.kind.as_sql(),
+                    idx: r.index as i64,
+                    bbox: (r.bbox.x, r.bbox.y, r.bbox.w, r.bbox.h),
+                    phash: r.phash,
+                    vector: r.vector.clone(),
+                })
+                .collect(),
         })
         .collect();
 
-    let outcome: Result<()> = rt.block_on(async {
-        database::upsert_pages_batch(pool, file_id, &rows).await?;
+    let outcome: Result<Vec<i64>> = rt.block_on(async {
+        let region_ids = database::insert_file_pages(pool, file_id, &new_pages).await?;
         database::mark_file_indexed(pool, file_id, pages.len() as i64).await?;
         if let Some(h) = content_sha1 {
             database::update_file_hash(pool, file_id, h).await?;
         }
-        Ok(())
+        Ok(region_ids)
     });
 
-    match outcome {
-        Ok(()) => {
-            tracing::debug!(
-                "Indexed: {} ({} pages)",
-                file_path.display(),
-                pages.len()
-            );
-            progress.processed.fetch_add(1, Ordering::Relaxed);
-        }
+    let region_ids = match outcome {
+        Ok(ids) => ids,
         Err(e) => {
             tracing::warn!(
                 "Failed to persist indexed pages for {}: {}",
@@ -455,6 +473,45 @@ fn handle_indexed(
                 e
             );
             progress.failed.fetch_add(1, Ordering::Relaxed);
+            return;
         }
+    };
+
+    // ── Feed the in-memory stores, zipping ids with the flattened regions ─
+    // insert_file_pages returns ids in the exact order the regions were
+    // provided (pages outer, regions inner).
+    let flat_regions: Vec<&crate::indexer::subprocess::RegionData> =
+        pages.iter().flat_map(|p| p.regions.iter()).collect();
+    debug_assert_eq!(flat_regions.len(), region_ids.len());
+
+    let vec_batch: Vec<(VectorId, Vec<f32>)> = region_ids
+        .iter()
+        .zip(flat_regions.iter())
+        .map(|(id, r)| (*id as VectorId, r.vector.clone()))
+        .collect();
+    let phash_batch: Vec<(i64, u64)> = region_ids
+        .iter()
+        .zip(flat_regions.iter())
+        .map(|(id, r)| (*id, r.phash))
+        .collect();
+
+    if let Err(e) = index.add_batch(&vec_batch) {
+        // Not fatal: the vectors are already durable in SQLite; a rebuild
+        // will pick them up.  Flag loudly so the operator notices.
+        tracing::error!(
+            "HNSW insert failed for {} ({} vectors — recoverable via index rebuild): {}",
+            file_path.display(),
+            vec_batch.len(),
+            e
+        );
     }
+    phash_store.add_batch(&phash_batch);
+
+    tracing::debug!(
+        "Indexed: {} ({} pages, {} regions)",
+        file_path.display(),
+        pages.len(),
+        region_ids.len(),
+    );
+    progress.processed.fetch_add(1, Ordering::Relaxed);
 }

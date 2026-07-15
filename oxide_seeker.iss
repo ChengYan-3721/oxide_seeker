@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "OxideSeeker"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "严成"
 #define MyAppURL "https://space.bilibili.com/253775617"
 #define MyAppExeName "oxide_seeker.exe"
@@ -59,9 +59,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "D:\oxide_seeker\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "D:\oxide_seeker\{#MyServiceExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "D:\oxide_seeker\config.toml"; DestDir: "{app}"; Flags: ignoreversion
-Source: "D:\oxide_seeker\clip_visual.onnx"; DestDir: "{app}"; Flags: ignoreversion
+Source: "D:\oxide_seeker\dinov2_vits14_int8.onnx"; DestDir: "{app}"; Flags: ignoreversion
 Source: "D:\oxide_seeker\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "D:\oxide_seeker\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "D:\oxide_seeker\ppocr_det.onnx"; DestDir: "{app}"; Flags: ignoreversion
+Source: "D:\oxide_seeker\ppocr_rec.onnx"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Dirs]

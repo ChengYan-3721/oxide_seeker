@@ -38,10 +38,10 @@ pub struct ProcessedFile {
 }
 
 /// Target long-edge pixel size for index-time rendering.
-/// CLIP ViT-B/32 only needs 224×224; we render at 512px so there is enough
-/// detail for pHash and thumbnail generation without wasting CPU/RAM at 1240px.
-/// Thumbnail saving further downscales to THUMB_SIZE (256px).
-const RENDER_TARGET_PX: i32 = 512;
+/// Tiles are ½ of the page per edge (~320 px at 640), which downsamples to
+/// the encoder's 224-px input with detail to spare; 640 also stabilises
+/// per-tile pHash.  Thumbnail saving further downscales to THUMB_SIZE (256px).
+const RENDER_TARGET_PX: i32 = 640;
 
 /// Render all pages of a PDF or AI file.
 ///
@@ -129,7 +129,7 @@ pub fn process_file(
 }
 
 /// Convert a PDFium `PdfBitmap` to an `image::DynamicImage`.
-fn bitmap_to_dynamic_image(bitmap: &PdfBitmap) -> Result<DynamicImage> {
+pub fn bitmap_to_dynamic_image(bitmap: &PdfBitmap) -> Result<DynamicImage> {
     // PDFium returns BGRA bytes by default
     let width = bitmap.width() as u32;
     let height = bitmap.height() as u32;
@@ -177,8 +177,6 @@ mod tests {
     fn test_bgra_to_rgba_conversion() {
         // Single pixel: B=10, G=20, R=30, A=255
         let bytes = vec![10u8, 20, 30, 255];
-        let width = 1u32;
-        let height = 1u32;
         let mut rgba = vec![0u8; 4];
         // Replicate conversion logic
         rgba[0] = bytes[2]; // R

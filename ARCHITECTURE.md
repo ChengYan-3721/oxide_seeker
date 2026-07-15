@@ -1,13 +1,18 @@
-# OxideSeeker — 以图搜文件系统架构设计
+# OxideSeeker — 以图搜文件系统架构设计（v2）
 
 ## 项目概述
 
 **OxideSeeker** 是一个运行在 Windows 上的 Rust 后端服务，支持局域网用户通过浏览器上传截图、快速匹配服务器上的 PDF/AI 设计文件。
 
-- **核心算法**：CLIP 图像向量相似度搜索（主） + pHash 感知哈希快速过滤（辅） + 多信号融合重排
-- **运行环境**：纯 CPU，16核+，32GB+ 内存，无 GPU
+- **核心算法**：DINOv2 视觉向量（主，整页 + 重叠 tile 双粒度） + OCR 文本通道（FTS5） + pHash 内存表，**三信号融合排序**
+- **典型查询**：**局部截图为主**（用户截取页面的一部分），整页截图为辅
+- **运行环境**：纯 CPU，16核+，128GB 内存，无 GPU
 - **文件规模**：几十万个 PDF / Adobe Illustrator (AI) 文件
 - **访问方式**：局域网浏览器，Web UI
+
+> v1（CLIP ViT-B/32 + 不重叠 grid tile + SQLite pHash 全表扫描）在 30 万文件
+> 规模下检索质量与延迟均不可用，v2 为完全重构，数据库/索引与 v1 不兼容。
+> 重构决策与阶段性成果见 `REFACTOR_PLAN.md`，OCR 通道方案见 `OCR_PLAN.md`。
 
 ---
 
@@ -15,517 +20,371 @@
 
 ```mermaid
 graph TD
-    A[用户浏览器] -->|上传截图/粘贴图片| B[Web 服务层 Axum]
-    B -->|搜索请求| C[搜索引擎]
-    C -->|pHash 快速预过滤| D[pHash 索引 SQLite]
-    C -->|CLIP 向量相似度| E[HNSW 向量索引 hnsw_rs]
-    D & E -->|候选集合并| F[多信号重排 ranker]
+    A[用户浏览器] -->|上传截图 前端预压缩 2048| B[Web 服务层 Axum]
+    B -->|尺寸校验 60MP + 降采样 1600| C[搜索引擎]
+    C -->|DINOv2 编码| C1[视觉向量]
+    C -->|PP-OCR 识别 与编码并行| C2[查询文本]
+    C1 -->|HNSW 取500 ef=256| E[HNSW 向量索引 hnsw_rs]
+    C2 -->|FTS5 MATCH bm25| FT[page_ocr_fts]
+    C -->|u64 XOR+popcount rayon| D[pHash 内存表]
+    D & E & FT -->|按 page_id 聚合| F[三信号融合 ranker]
     F -->|返回文件信息+缩略图| A
 
-    G[文件索引器 后台服务] -->|扫描文件系统| H[PDF/AI 文件]
-    H -->|渲染每页| I[图像渲染 pdfium]
-    I -->|提取 pHash| D
-    I -->|批量 CLIP 推理| J[ONNX Runtime 多 Session]
-    J --> E
-    G -->|批量事务写入| D
+    G[文件索引器 子进程隔离] -->|扫描文件系统| H[PDF/AI 文件]
+    H -->|渲染 640px| I[图像渲染 pdfium]
+    I -->|整页 + 9个50%重叠tile| J[DINOv2 推理 + pHash]
+    J -->|向量 BLOB 落库| S[(SQLite regions 表)]
+    S -->|region_id 回填| E
+    S -->|region_id 回填| D
+    S -.图缺失/损坏时.->|流式重灌 ~20min 无需推理| E
 
+    O[OCR 回填 独立子进程] -->|渲染 1280px + PP-OCR| FT
     K[文件监控 notify] -->|增量更新| G
 ```
+
+> 所有 FFI 密集环节（pdfium 渲染、DINOv2/OCR 推理）都跑在崩溃隔离子进程中，
+> 子进程内置请求看门狗防挂死；父进程只做 DB 与内存索引维护。详见「§9 崩溃
+> 隔离与看门狗」。
 
 ---
 
 ## 核心技术选型
 
-### 1. 图像向量化 — CLIP 模型（ONNX 格式）
+### 1. 图像向量化 — DINOv2 ViT-S/14（ONNX）
 
 | 项目 | 选型 |
 |------|------|
-| 模型 | `openai/clip-vit-base-patch32`（ONNX 导出版） |
-| 推理引擎 | `ort` 2.0.0-rc.12（锁定精确版本，避免 RC 期 API 漂移） |
-| 向量维度 | 512 维 float32，L2 归一化（使用 DistDot 跳过重复归一化计算） |
-| CPU 推理速度 | 单张 ~50-200ms，批量 ~20ms/张（16核 CPU） |
-| 模型文件大小 | FP32 约 350 MB；**INT8 量化后约 90 MB（可选）** |
+| 模型 | `dinov2_vits14`（Meta，自监督，Apache-2.0） |
+| 推理引擎 | `ort` 2.0.0-rc.12（锁定精确版本） |
+| 向量维度 | 384 维 float32，L2 归一化（DistDot 跳过重复归一化） |
+| 输入 | 224×224（patch 14 → 16×16 patches），**letterbox** 保长宽比，ImageNet mean/std 归一化 |
+| 模型文件 | FP32 约 85 MB；INT8 量化约 25 MB（CPU 2-3× 加速） |
+| 导出 | `python scripts/export_dinov2.py`（含 ONNX/Torch 输出一致性自检） |
 
-**为什么选 CLIP？**
-- 支持图像-图像相似度搜索，天然适合"以图搜图"
-- 对局部截图也有一定泛化能力（ViT 分块注意力机制）
-- 有成熟的 ONNX 导出版本，可完全离线运行
-- 开源、免费、无需 GPU
+**为什么从 CLIP 换成 DINOv2？**
 
-**ONNX 模型获取方式：**
-```bash
-pip install transformers optimum[onnxruntime]
-optimum-cli export onnx --model openai/clip-vit-base-patch32 \
-    --task feature-extraction clip_onnx/
-# → clip_onnx/vision_model.onnx
-```
-拷贝到 `models/clip_visual.onnx` 即可。
+任务是**实例检索**（找"同一张图"），不是语义检索。CLIP 的向量空间按语义组
+织——30 万库中同版式设计稿全部挤在 0.85-0.95 相似度区间，库越大区分度坍塌
+越严重。DINOv2 的自监督特征在 instance-level 检索基准上显著优于 CLIP，对局
+部-整体匹配（局部截图召回整页）泛化更好，且 FLOPs 仅为 CLIP ViT-B/32 的
+~1.5×。升级路径：`dinov2_vitb14`（768 维，更准，~3× 慢），代码零改动（维度
+从输出自动探测），仅需全量重建。
 
-**INT8 动态量化（可选，2-3× CPU 加速，<1% 精度损失）：**
-```bash
-optimum-cli onnxruntime quantize --avx512 \
-    --onnx_model clip_onnx/vision_model.onnx -o clip_int8/
-# → clip_int8/vision_model_quantized.onnx
-```
-直接替换到同一路径 (`models/clip_visual.onnx`)，**无需代码改动**——
-`ClipEmbedder::load` 会透明地接受量化模型。量化后多 Session 的内存占用也随
-之成比例下降（8 worker × 90 MB ≈ 720 MB）。
+**引擎与模型解耦**：`VisionEmbedder` 接受任意输入为 `pixel_values
+[N,3,224,224]`、输出 `[N,D]` 的 ONNX 编码器；嵌入维度 D 运行时探测。
 
-#### CLIP 推理并发模型（重点重构）
-
-旧设计：单例 `Arc<Mutex<Session>>`，所有 Rayon worker 通过同一把锁串行推理，
-8 线程 CPU 实际只有 1 线程在跑 ONNX → 多 worker 并发完全失效。
-
-新设计拆成两类：
+#### 推理并发模型
 
 | 类型 | 用途 | 数量 | 加锁 |
 |------|------|------|------|
-| `ClipEmbedder`（工厂） | 持有模型路径，`new_session(intra_threads)` 按需生成 session | 单例，`Arc` 共享 | 无 |
-| `ClipSession`（推理句柄） | 拥有一个 `ort::Session` | **索引器每 worker 各一份**；查询路径单例 `Mutex` 包 | 查询路径的 `Mutex` 只影响少量并发查询 |
+| `VisionEmbedder`（工厂） | 持模型路径，`new_session(intra_threads)` 按需生成 | 单例 `Arc` | 无 |
+| `VisionSession`（推理句柄） | 拥有一个 `ort::Session` | 索引器每 worker 各一份（intra=1）；查询路径单例 `Mutex`（intra=全核） | 仅查询路径 |
 
-- **索引侧**：rayon 每个 worker 在 `scope.spawn` 开始时调用
-  `clip.new_session(1)`（intra-op=1，outer rayon 供应并行），各 session 独立
-  且无锁，真正并行。
-- **查询侧**：`SearchEngine` 持有单个 `Arc<Mutex<ClipSession>>`，每查询锁一次，
-  session 的 intra-op 设为 `num_cpus`，单查询吃满 CPU。
+### 2. 双粒度索引 — 整页 + 50% 重叠 tile（局部截图召回的核心）
 
-#### 批量推理
+每页产生 **10 个 region**：整页 1 个 + 重叠 tile 9 个。
 
-`ClipSession::encode_batch(&[&DynamicImage])` 把一个文件的所有页堆成
-`[N, 3, 224, 224]` 一次性前向推理。对 10 页 PDF 节省约 9 次 Python→ORT
-桥接和 TokenizedRequest 构造开销，整体吞吐提升 ~40%。
+- tile 尺寸 = 页面的 ½（每边），步长 = ¼ → 每边 3 个位置，3×3 = 9 个，相邻重叠 50%
+- **覆盖保证**：任何小于页面 ¼ 的目标区域必被某个 tile 完整包含；¼-½ 的大
+  部分落入某 tile；更大的由整页向量覆盖
+- v1 的不重叠 3×3 grid 有边界效应：目标跨 tile 边界时两边都只含一半，全都
+  不匹配——这是局部截图召回差的主要原因之一
+- `indexer.tiles_enabled = false` 可退化为每页 1 向量
 
-### 2. 向量索引库 — `hnsw_rs`（纯 Rust）
+### 3. 向量存储与索引 — SQLite BLOB（真相源） + hnsw_rs（可重建缓存）
+
+**向量以 f32-LE BLOB 存进 `regions.vector`，HNSW 图只是缓存**：
+
+- `regions.id` 即 HNSW 向量 id——DB 行与 ANN 条目永不漂移
+- 图文件缺失/损坏/参数调整/墓碑压缩 → 启动时从 DB 流式重灌
+  （600 万向量 ~15-25 分钟），**永不需要重跑模型推理**（重跑是天级成本）
+- 写入顺序：DB 事务先提交 → 内存结构（HNSW + pHash 表）后插入；
+  中间崩溃只留下可重建的缺口，不会有悬空引用
+
+HNSW 参数：`M=16`, `ef_construction=200`, **`ef_search=256`**（v1 的 64 在
+数百万向量下召回不足），查询 over-fetch `max(top_k×25, 500)`（10 region/页
+聚合后仍有充足页级候选）。
+
+### 4. pHash — 内存表 + rayon 并行扫描
+
+- 每个 region（含 tile）一个 64-bit pHash（DoubleGradient 8×8），
+  SQLite 存 `INTEGER`（u64 位转换 i64），**u64 全程无 hex 字符串**
+- 启动时全量加载进 `PhashStore`（600 万条 ≈ 96 MB），查询时 rayon
+  XOR+popcount，单次扫描 <10ms
+- v1 每次查询 `SELECT id, phash FROM pages` 全表拉取 + 逐行 String 分配，
+  30 万文件时**这一步就是秒级延迟的主源**
+- 重叠 tile 的独立 pHash 让"局部截图对准某个 tile 位置"也能享受近重复强信
+  号——v1 的整页 hash 对局部查询完全失效
+- 候选截断 2000，防止低熵页面（色卡/留白）泛滥
+
+### 5. OCR 文本通道 — PP-OCR + FTS5（同版式区分的关键）
+
+评测标定发现命中目标的视觉相似度分布（p05=0.76）与噪声 top1 分布
+（p50=0.83）**严重重叠**——视觉信号无法区分「同版式不同文字」的设计稿
+（同一模板换个产品名/型号）。文字是唯一正交的强区分信号。
+
+**引擎**：PP-OCRv3 det + rec，**纯 Rust 推理**（复用 `ort`，零新部署依赖）：
+
+| 阶段 | 实现 | 说明 |
+|------|------|------|
+| det（检测） | DBNet：概率图 → 二值化 → 3×3 膨胀 → 连通域 → 轴对齐框 + DB unclip 扩张 | 印前文字以水平为主，轴对齐省掉旋转矩形/透视变换整套依赖 |
+| rec（识别） | CRNN/SVTR：48px 高文字条 → softmax → 贪心 CTC 解码 | 6625 类词表内嵌在 ONNX metadata，部署仍是两个文件 |
+
+阅读顺序排序用**两趟分组**（先按中点全序排序，再切行带内按 x 排）——
+早期用单比较器"中点相近算同行"违反传递性，在文字密集页触发 Rust 排序的
+非全序 panic（线上故障，已修）。
+
+**全文索引**：SQLite FTS5 + **trigram 分词**：
+
+- 中文无需分词器；子串匹配（截图只含 "UK1457" 也能命中 "VUK1457-115T"）；对 OCR 错字有韧性（其余 trigram 仍匹配）
+- `page_ocr` 存文本，FTS5 external-content 表 + 三触发器保持同步
+- 查询侧 OCR 文本按空白切段（≥3 字符），最长的 16 段 OR 组合 MATCH，取 top 500 页 + bm25，min-max 归一到 `[0,1]`
+
+**回填模型**：OCR 不在索引管线内做，而由独立后台循环认领缺 `page_ocr` 行
+的页（`pages.id` 游标增量扫描），渲染 1280px（640px 对小字号识别不可用）→
+识别 → 入库。文件变更时 CASCADE 清行、自动重做。回填走**独立子进程**（同
+崩溃隔离协议 + 看门狗），一页挂死不阻塞其余。
+
+### 6. 融合排序 — 三信号
+
+```
+score = 0.70 × max(region 视觉 sim)          -- 主信号，按 page 取 region max
+      + 0.10 × (1 − min(hamming)/64)          -- 近重复辨识，按 page 取 region min
+      + 0.20 × text_score                     -- OCR/FTS bm25 归一化，同版式区分
+```
+
+- 三权重可从 `config.toml`（`weight_vector/phash/text`）调整，**无需重编译**
+- **文本是独立召回源**：仅文本命中的页（视觉未召回）也进排序，`sim` 取 0 —
+  强文本匹配（text_score≈1）得 0.2 分足以进 top-K，这是同版式文件靠文字翻盘
+  的机制
+- v1 的 first-page / tile-hit bonus 已删除（重叠 tile 下 tile 命中不再携带额外
+  信息，且从未被评测验证）
+- `similarity_threshold = 0.30` 仅为宽松噪声下限；实际排序由融合分决定；
+  **所有权重/阈值调整必须过 `--evaluate` 评测**
+
+**评测实证**（seed=42，纯视觉 → +OCR）：R@1 21.8%→30.4%（+39%）、
+MRR 0.323→0.404、medium 桶 R@5 +12.4pp。OCR 主要作用是把已在候选里的正确答
+案顶到前排（R@1/MRR 涨幅 >> R@10）。
+
+### 7. PDF 渲染 — pdfium-render
 
 | 项目 | 选型 |
 |------|------|
-| 库 | `hnsw_rs` 0.3（纯 Rust，无 C++ 构建） |
-| 算法 | HNSW（Hierarchical Navigable Small World） |
-| 距离 | `DistDot`（预归一化向量的点积，等价于 1 − cos(θ)，比 `DistCosine` 少一次重复归一化） |
-| 增量插入 | **O(log N)**，不触发图重建——搜索立即可见新向量 |
-| 删除 | 墓碑标记（`HashSet<VectorId>`），搜索时 over-fetch 再过滤 |
-| 并发 | `insert` / `search` 皆 `&self`；库内部 `RwLock` 保证线程安全 |
-| 支持规模 | 百万级向量 |
-| 搜索延迟 | 10-50 ms（Top-K 搜索） |
-| 持久化 | `file_dump` 生成 `.hnsw.graph` + `.hnsw.data`，另加 `meta.bin` 记录 `next_id` 与墓碑集 |
+| 库 | `pdfium-render` 0.8（`thread_safe` feature） |
+| 索引分辨率 | 长边 **640 px**（tile = ½ 页 ≈ 320px → 缩到 224 仍有细节余量；pHash 更稳定） |
+| OCR 分辨率 | 长边 **1280 px**（小字号识别需要） |
+| 隔离 | 全部渲染跑在子进程；FFI 崩溃只死子进程，父进程重启之 + crash_attempts 毒丸黑名单 |
 
-**为什么换掉 `instant-distance`？**
-`instant-distance` 不支持 `insert`，每次 `add` 后必须重建整图
-——旧实现因此维护了"entries + 异步重建 Arc 快照"的复杂状态机，
-百万向量时每次重建需 5-10s 并额外拷贝 2GB 向量内存。
-`hnsw_rs` 原生支持增量插入，配合墓碑删除后代码从 ~300 行缩减到 ~230 行，
-且彻底消除了副本存储——内存占用从 "graph + entries 双份" 减到 "只有 graph"，
-100 万 512-dim 向量节省约 2 GB 内存。
+**AI 文件**：内嵌 PDF 内容，pdfium 直接解析。
+**拼版过滤**：XMP `egExtFL:files` 原字节预扫描，PDFium 打开前零成本跳过。
 
-**超参数**：`M=16`, `ef_construction=200`, `ef_search=64`（过墓碑时动态 over-fetch）。
+### 8. 崩溃隔离与看门狗
 
-**批量插入**：`add_batch` 在 batch ≥ 64 时调用 `parallel_insert`，由
-hnsw_rs 内部并行分层插入。
+FFI 代码有两种失败模式，都会拖垮进程内调用方，故全部推到子进程：
 
-### 3. pHash 感知哈希 — 快速预过滤
+1. **崩溃**（结构化异常，如 pdfium `0xE0000008`）：Rust `catch_unwind` 抓不
+   到 SEH。子进程死 → 父进程观察到管道断裂 → 记失败/空结果、重启子进程。
+2. **挂死**（FFI 调用既不返回也不崩，线上在 OCR 分辨率的病态页面上出现过）：
+   子进程内置**看门狗线程**，每个请求前 arm 一个 deadline（索引 600s / OCR
+   120s），超时则 `exit(3)`——父进程同样当管道断裂处理。
 
-- 每张渲染页生成 64-bit pHash（`image_hasher`, DoubleGradient）
-- 存储在 SQLite；查询时全量扫描 + 汉明距离计算（百万级 8 bytes = 8 MB，L3 cache 常驻）
-- 阈值 ≤ 12 视为候选
-- 作用：对**近重复 / 精确裁剪**场景提供强信号，补 CLIP 语义匹配在"高度相似"分段的辨识力
+`crash_attempts` 计数在每次尝试前持久化（WAL），崩溃后仍在，达阈值自动加入
+毒丸黑名单。这套隔离同时覆盖索引 worker 与 OCR 回填 worker。
 
-### 4. PDF 渲染 — pdfium-render
+### 9. NaN 向量三道防护
 
-| 项目 | 选型 |
-|------|------|
-| 库 | `pdfium-render` 0.8（PDFium 的 Rust 绑定，`thread_safe` feature） |
-| 功能 | 将 PDF 每页渲染为位图 |
-| 分辨率 | 索引时长边 512 px（兼顾 CLIP 输入 224 和 pHash 稳定性） |
-| 每线程一个 | PDFium `!Send`，worker 启动时各初始化一份 |
+INT8 量化模型在病态页面上偶发输出 NaN 向量，NaN 进入 HNSW 后毒化后续所有
+距离排序（违反全序 → Rust 排序 panic，线上故障）。三道防线：
 
-**AI 文件处理**：Adobe Illustrator `.ai` 文件实际上内嵌了 PDF 内容，可直接用 pdfium 解析。
+1. **源头**：`l2_normalize` 检测非有限值 → 替换为零向量（与一切距离为 1，
+   永不参与排名）
+2. **排序**：所有 f32 排序用 `total_cmp`（NaN 混入也不 panic）
+3. **重建**：HNSW 从库重建时过滤历史毒向量（删 dump 重启即清理）
 
-### 5. 拼版 PDF 过滤器（排除非单标文件）
+### 10. Web / 存储 / 监控
 
-判断"含链接的拼版 PDF"的启发式规则：
-1. **XMP `egExtFL:files`**：解析 PDF 头部 XMP packet，若元数据列出了带
-   非相对路径（非 `file:./…` / `file:../…`）的 `.pdf` 引用 → 视为拼版 → 排除
-2. 仅链接到 PSD / TIFF / EPS 等非 PDF 资源的文件 → 保留
+- Axum：multipart 上传、base64 剪贴板、WebSocket 进度、静态资源编译内嵌
+- **大图处理**：前端 canvas 预压缩到长边 2048；服务端上传上限 64MB，读图头
+  校验 ≤60MP（超限返回明确 400 而非 opaque 500），解码后统一降到长边 1600
+  再进管线（避免上亿像素原图在编码/OCR/pHash 里多次克隆）
+- SQLite（sqlx）：WAL + synchronous=NORMAL + 外键
+- 无损 WebP 缩略图（256px，仅页级一张）
+- notify watcher + 定时重扫 + content_sha1 短路（mtime 变了但字节没变不重索引）
+- HNSW `save()` 加互斥锁：周期重扫与 watcher 删除并发保存会争 tmp 文件互相
+  报错（线上 868 次），串行化解决
 
-这一阶段运行在 PDFium 打开之前（快 raw-byte 扫描），对命中的拼版文件零成本跳过。
+### 11. 评测框架 — `--evaluate`（合成查询集）
 
-### 6. Web 服务 — Axum
+```bash
+oxide_seeker.exe --evaluate --config config.toml \
+    --samples 300 --queries-per-page 3 --seed 42 \
+    --label my-run --out eval.json
+```
 
-- 异步 HTTP 服务器，支持文件上传（multipart）和剪贴板粘贴（base64）
-- 静态文件服务（前端 HTML/JS/CSS 以及缩略图目录）
-- WebSocket 支持（实时索引进度推送）
+- 从已索引页**确定性采样**（拉全量 → seeded RNG 洗牌 → 截断；同 seed 严格
+  复现同一查询集，早期用 SQL `ORDER BY RANDOM()` 无法复现，已修）
+- pdfium 以 900px（≠索引侧 640px，避免像素同源）重渲染 → 随机裁剪
+  （面积 8%-90%，模拟局部截图为主的分布）+ 缩放 + 亮度扰动 + JPEG 往返
+- 指标：Recall@1/@5/@10、MRR、**分阶段延迟 P50/P95**（encode/ocr/ann/phash/
+  rank，定位瓶颈）、按裁剪面积分桶、**阈值标定统计**（命中/噪声相似度分布）
+- 输出 console 报告 + JSON（`--label` 标记，跨改动 diff）
+- 与服务实例可并存（无单实例锁），只读搜索栈；OCR 通道按配置自动启用
 
-### 7. 数据存储 — SQLite（via sqlx）
+---
 
-存储文件元数据、pHash、缩略图路径、索引状态。
-- `WAL` 模式 + `synchronous=NORMAL` + 外键
-- **热路径批量写入**：`database::upsert_pages_batch` 把一个文件的所有页行
-  放进 **一个事务**提交，30 页 PDF 从 30 次往返变 1 次，显著减少 SQLite
-  fsync / WAL 压力。
+## 数据库 Schema（migrations/）
 
-### 8. 缩略图 — 无损 WebP
+`001_initial.sql`（视觉三表）：
 
-- 编码：`image` crate 内置 WebP 无损编码（纯 Rust，无 libwebp C 依赖）
-- 体积：对设计稿（大面积纯色 + 几何图形）通常比 JPEG q=85 小 20-40%
-- 无有损伪影 → 后续若需要重新对缩略图做 pHash 也不会出现失配
-- 文件名：`{file_id}_{page_num}.webp`（向前兼容：老的 `.jpg` 仍可被
-  `ServeDir` 正确返回，数据库 `thumb_path` 字段存的是完整相对路径）
+```sql
+files   (id, path UNIQUE, filename, file_type, file_size, modified_at,
+         page_count, is_excluded, indexed_at, created_at,
+         crash_attempts, exclusion_reason, content_sha1)
+
+pages   (id, file_id→files, page_num, width_px, height_px, thumb_path,
+         UNIQUE(file_id, page_num))          -- 每页一行
+
+regions (id,               -- == HNSW 向量 id
+         page_id→pages, kind 'full'|'tile', idx 0-8,
+         bbox_x/y/w/h,     -- 归一化坐标,整页=(0,0,1,1),预留圈选高亮
+         phash INTEGER,    -- u64 位转换 i64
+         vector BLOB,      -- f32-LE,维度由字节长度推断
+         UNIQUE(page_id, kind, idx))
+
+index_tasks (id, file_id, status, error_msg, attempts, ...)
+```
+
+`002_ocr.sql`（OCR 文本通道，纯增量，可加到现有库）：
+
+```sql
+page_ocr (page_id→pages PK, text, ocr_at)              -- 每页 OCR 文本
+page_ocr_fts USING fts5(text, content='page_ocr',      -- 全文索引
+         content_rowid='page_id', tokenize='trigram')
++ 3 触发器（INSERT/DELETE/UPDATE 同步 content → fts）
+```
+
+> v1 数据库无迁移路径（嵌入模型变了，向量必须全部重算）：删除 data 目录重建。
+> OCR 表则是纯增量——已建好的视觉库直接加表，后台回填即可。
+
+---
+
+## 搜索流程
+
+1. 上传图 → 前端预压缩长边 2048 → 服务端校验 ≤60MP、降采样长边 1600
+2. **并行**：DINOv2 编码（~600ms，延迟大头） ‖ PP-OCR 识别（~300ms，被编码遮蔽）
+3. 查询图 → pHash u64
+4. HNSW 取 500（ef=256），按 region_id 取最小距离合并（~13ms）
+5. pHash 内存表 rayon 扫描，阈值 ≤12，截断 2000（~37ms）
+6. 查询文本 → FTS5 MATCH，取 top 500 页 + bm25 归一化
+7. `get_region_hits` 一次 join 解析 region → page，按 page_id 聚合三信号
+8. 融合排序 → Top-K → 批量取 pages/files 行组装（缩略图、元数据）
+
+**实测延迟 P50 ≈ 746ms**（INT8 模型 + OCR，编码占 ~600ms）。查询侧 OCR 崩溃
+/panic 降级为纯视觉搜索，不会让请求失败。
+
+## 索引流程
+
+1. 扫描 + 过滤（mtime → content_sha1 短路 → crash 黑名单）
+2. 子进程：pdfium 渲染 640px → 切 1+9 region → 批量推理（chunk 32）→ 每 region pHash
+3. 父进程：单事务 INSERT pages+regions（含向量 BLOB）→ 拿回 region_ids
+4. HNSW `add_batch` + PhashStore `add_batch`（失败可由重建自愈）
+5. 每 500 文件 checkpoint 保存 HNSW dump
+6. **OCR 回填**（独立后台循环）：认领缺 `page_ocr` 的页 → 子进程渲染 1280px +
+   识别 → 入库；扫空后给孤儿页（已索引但后被排除的文件页）写空占位行使
+   `ocr_pending` 收敛到 0
+
+**索引速度估算**（16 核，INT8，tiles on）：向量索引 ≈ 5-9 页/s/worker，
+30 万文件 ≈ 7-15 小时；OCR 回填 8-17 小时后台独立进行，不阻塞搜索。一次性
+成本，向量落库后永不重复。
 
 ---
 
 ## 项目模块结构
 
 ```
-oxide_seeker/
-├── Cargo.toml
-├── ARCHITECTURE.md
-├── onnxruntime.dll / pdfium.dll   # 随 exe 一起发布
-├── models/
-│   └── clip_visual.onnx           # 可为 FP32 或 INT8 量化版
-├── data/
-│   ├── index.db                   # SQLite 数据库
-│   ├── vectors.hnsw.graph         # HNSW 图结构（hnsw_rs 原生格式）
-│   ├── vectors.hnsw.data          # 向量数据
-│   ├── vectors.meta.bin           # next_id + 墓碑集
-│   └── thumbnails/                # WebP 缩略图缓存
-├── migrations/
-│   └── 001_initial.sql            # SQLite schema
-└── src/
-    ├── main.rs                    # 入口：启动服务 + 初始化
-    ├── config.rs                  # 配置加载（TOML）
-    ├── error.rs                   # 统一错误类型
-    │
-    ├── indexer/
-    │   ├── mod.rs                 # 索引器入口
-    │   ├── scanner.rs             # 文件系统扫描（walkdir）
-    │   ├── watcher.rs             # 文件变更监控（notify）
-    │   ├── pdf_processor.rs       # PDF/AI 渲染 + 页面提取
-    │   ├── filter.rs              # 拼版 PDF 过滤器（XMP 扫描）
-    │   └── worker_pool.rs         # 并发索引工作池（每 worker: PDFium + ClipSession + 批量 DB）
-    │
-    ├── embedder/
-    │   ├── mod.rs
-    │   ├── clip.rs                # ClipEmbedder (工厂) + ClipSession (推理句柄)
-    │   ├── phash.rs               # pHash 计算
-    │   └── image_prep.rs          # 图像预处理（resize + ImageNet 归一化）
-    │
-    ├── search/
-    │   ├── mod.rs                 # SearchEngine 协调 CLIP + pHash + 重排
-    │   ├── vector_index.rs        # hnsw_rs HNSW 向量索引 + 墓碑删除
-    │   ├── phash_index.rs         # SQLite pHash 查询
-    │   └── ranker.rs              # 多信号融合重排（CLIP + pHash + 页位置）
-    │
-    ├── storage/
-    │   ├── mod.rs
-    │   ├── database.rs            # SQLite 操作（含 upsert_pages_batch）
-    │   └── thumbnail.rs           # 缩略图生成（WebP）
-    │
-    └── web/
-        ├── mod.rs                 # Axum 路由注册
-        ├── handlers.rs            # HTTP 请求处理器
-        ├── ws_handler.rs          # WebSocket 进度推送
-        └── static/               # 前端静态文件
-            ├── index.html
-            ├── app.js
-            └── style.css
+src/
+├── main.rs                    # 入口：--worker-mode / --evaluate / 服务启动
+├── evaluate.rs                # 合成查询评测框架（指标 + 分阶段延迟 + 标定）
+├── config.rs                  # 配置（tiles_enabled / 融合权重 / OCR 路径等）
+├── worker_proc.rs             # 子进程：渲染 + tile 切割 + 推理 + pHash + OCR，含看门狗
+│
+├── embedder/
+│   ├── vision.rs              # VisionEmbedder/VisionSession（模型无关 ONNX 编码器 + NaN 防护）
+│   ├── image_prep.rs          # letterbox + ImageNet 归一化 → NCHW 224
+│   └── phash.rs               # u64 pHash + XOR/popcount 汉明距离
+│
+├── ocr/
+│   ├── mod.rs                 # OcrEngine（det+rec 编排 + 置信度过滤）
+│   ├── det.rs                 # DBNet 检测：概率图 → 连通域 → 轴对齐框 + 两趟阅读序
+│   └── rec.rs                 # CRNN 识别：文字条预处理 + 贪心 CTC 解码（词表内嵌）
+│
+├── indexer/
+│   ├── mod.rs                 # start_full_index（扫描/过滤/清理编排）
+│   ├── scanner.rs / watcher.rs / filter.rs / pdf_processor.rs
+│   ├── subprocess.rs          # 父子进程协议（WorkerRequest: Index | OcrPage）
+│   ├── worker_pool.rs         # DB 先行提交 → region_ids 回填双内存索引
+│   └── ocr_backfill.rs        # 后台 OCR 回填循环（子进程隔离 + 游标增量）
+│
+├── search/
+│   ├── mod.rs                 # SearchEngine（并行编码+OCR）+ rebuild_index_if_needed + 大图处理
+│   ├── vector_index.rs        # hnsw_rs 封装（id=regions.id, ef=256, 墓碑, save 互斥）
+│   ├── phash_store.rs         # 内存 pHash 表（rayon 扫描, 增量维护）
+│   └── ranker.rs              # page_id 聚合 + 三信号融合（total_cmp 排序）
+│
+├── storage/
+│   ├── database.rs            # 五表 CRUD + 向量 BLOB 编解码 + FTS 检索 + 流式重建
+│   └── thumbnail.rs
+│
+└── web/                       # Axum 路由/handlers/WS（含大图预压缩前端）
 ```
 
 ---
 
-## 数据库 Schema（SQLite）
+## 数据规模核算（30 万文件，约 28 万页 × 10 region ≈ 280 万向量）
 
-见 `migrations/001_initial.sql`。核心三张表：
+| 项 | 规模 | 占用 |
+|----|------|------|
+| HNSW 常驻 | 280 万 × 384d f32 | ~4.3GB RAM + 图 ~1GB |
+| pHash 内存表 | 280 万 × 16B | ~45MB RAM |
+| SQLite（含向量 BLOB + OCR 文本 + FTS） | | ~6GB 磁盘 |
+| 合计常驻 | | **~6GB RAM** / 128GB，余量充足 |
 
-```sql
--- 文件记录表
-CREATE TABLE files (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    path        TEXT NOT NULL UNIQUE,
-    filename    TEXT NOT NULL,
-    file_type   TEXT NOT NULL,              -- 'pdf' | 'ai'
-    file_size   INTEGER,
-    modified_at INTEGER,
-    page_count  INTEGER DEFAULT 1,
-    is_excluded INTEGER DEFAULT 0,          -- 1=拼版文件
-    indexed_at  INTEGER,
-    created_at  INTEGER DEFAULT (unixepoch())
-);
-
--- 页面记录表
-CREATE TABLE pages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    page_num   INTEGER NOT NULL,
-    phash      TEXT,                        -- 16 hex chars = 64 bits
-    vector_id  INTEGER,                     -- hnsw_rs 中的向量 id
-    thumb_path TEXT,                        -- 例：42_1.webp
-    width_px   INTEGER,
-    height_px  INTEGER,
-    UNIQUE (file_id, page_num)
-);
-
--- 索引任务状态
-CREATE TABLE index_tasks (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id    INTEGER REFERENCES files(id),
-    status     TEXT DEFAULT 'pending',
-    error_msg  TEXT,
-    attempts   INTEGER DEFAULT 0,
-    created_at INTEGER DEFAULT (unixepoch()),
-    updated_at INTEGER DEFAULT (unixepoch())
-);
-```
-
----
-
-## 搜索流程
-
-```mermaid
-graph LR
-    A[用户上传截图] --> B[图像预处理\n224x224 归一化]
-    B --> C[CLIP 编码\n512 维向量 L2 归一化]
-    B --> D[计算 pHash\n64-bit]
-
-    D --> E[SQLite 全量扫描\n汉明距离 ≤ 12\n候选 ~数百]
-    C --> F[hnsw_rs HNSW\nTop-K×5 近邻]
-
-    E --> G[候选合并\n按 page_id 去重]
-    F --> G
-    G --> H[多信号融合重排\n0.82·CLIP + 0.15·pHash + 0.03·first-page]
-    H --> I[返回 Top-K 结果\n含 similarity + score 两字段]
-```
-
-**多信号重排（`ranker::FusionWeights`）**
-
-| 信号 | 权重 | 说明 |
-|------|------|------|
-| CLIP 相似度 | 0.82 | 主信号，语义匹配 |
-| pHash 相似度（= 1 − distance/64） | 0.15 | 近重复强辨识，二义消除 |
-| 首页 bonus | +0.03 | 设计资产库头页命中率天然偏高 |
-
-**搜索延迟估算**（16 核 CPU，30 万页向量）：
-- CLIP 编码查询图：~100 ms
-- pHash 过滤：~5 ms
-- HNSW 搜索：~20 ms
-- 结果合并 + 重排 + DB fetch：~10 ms
-- **总计：约 135 ms**
-
----
-
-## 索引流程
-
-```mermaid
-graph TD
-    A[文件扫描器walkdir] --> B{是否已索引且未修改?}
-    B -->|是| C[跳过]
-    B -->|否| F[XMP 拼版过滤器]
-    F -->|命中| G[标记 is_excluded=1]
-    F -->|通过| D[PDFium 渲染全部页]
-    D --> H[保存缩略图256px WebP]
-    D --> I[批量计算 pHash]
-    D --> J[批量 CLIP 推理一次 forward 处理整个文件的所有页]
-    J --> K[批量 add_batch到 hnsw_rs HNSW]
-    K --> L[单事务批量 UPSERT pages一个文件一个 fsync]
-    L --> M[mark_file_indexed]
-```
-
-**索引速度估算**（16 核 CPU，FP32 模型）：
-- 单页 CLIP 推理：~100 ms（批量时摊到 ~60 ms）
-- 并发 worker：8 个（各自独占 ONNX Session——真并行）
-- 每秒处理页数：约 100-150 页
-- 10 万文件（平均 2 页）= 20 万页 → **约 22-33 分钟完成首次全量索引**
-
-切换 INT8 量化模型后：
-- 单页 CLIP 推理：~40 ms
-- 每秒处理页数：约 250-300 页
-- 10 万文件 → **约 11-13 分钟**
-
----
-
-## Web API 设计
-
-### `POST /api/search`
-上传图片进行搜索。
-
-**Request**：`multipart/form-data`
-- `image`: 图片文件（PNG/JPG/WEBP）
-- `top_k`: 返回结果数量（默认 20）
-
-**Response**：
-```json
-{
-  "total": 5,
-  "search_time_ms": 142,
-  "results": [
-    {
-      "file_path": "\\\\server\\designs\\client_A\\logo_v3.pdf",
-      "filename": "logo_v3.pdf",
-      "file_type": "pdf",
-      "page_num": 1,
-      "similarity": 0.923,
-      "score": 0.897,
-      "phash_distance": 3,
-      "thumbnail_url": "/thumbnails/42_1.webp",
-      "file_size": 2048576,
-      "page_count": 2,
-      "modified_at": "2024-03-15T10:30:00+00:00"
-    }
-  ]
-}
-```
-
-> `similarity` 是原始 CLIP 余弦相似度；`score` 是融合后的排序分数。
-
-### `POST /api/search/clipboard`
-从剪贴板粘贴（JSON + base64）。
-
-### `GET /api/index/status`
-获取索引进度。
-
-### `GET /thumbnails/{file_id}_{page_num}.webp`
-缩略图静态服务。
-
-### `WS /ws/progress`
-WebSocket 实时推送索引进度。
-
----
-
-## 配置文件（config.toml）
-
-```toml
-[server]
-host = "0.0.0.0"
-port = 7788
-
-[paths]
-scan_dirs = ["D:/Designs"]
-data_dir  = "C:/OxideSeeker/data"
-model_path = "C:/OxideSeeker/models/clip_visual.onnx"
-
-[indexer]
-worker_threads = 8     # 建议 = CPU 核数 / 2
-batch_size     = 8     # 预留，用于未来跨文件批量推理
-watch_enabled  = true
-render_dpi     = 150.0
-
-[search]
-default_top_k        = 20
-similarity_threshold = 0.65  # CLIP 余弦相似度阈值
-phash_threshold      = 12    # pHash 汉明距离阈值（0-64）
-
-[filter]
-# 拼版过滤器仅依赖 XMP egExtFL:files 检测，无需可调参数
-```
-
----
-
-## 关键 Rust 依赖
-
-```toml
-[dependencies]
-# Web framework
-axum        = { version = "0.7", features = ["multipart", "ws"] }
-tokio       = { version = "1", features = ["full"] }
-tower       = "0.4"
-tower-http  = { version = "0.5", features = ["fs", "cors", "trace"] }
-
-# ONNX inference — 精确锁定 RC 版本
-ort         = { version = "=2.0.0-rc.12", features = ["load-dynamic"] }
-ndarray     = "0.15"
-
-# Image processing — webp feature 提供无损 WebP 编解码
-image        = { version = "0.25", features = ["jpeg", "png", "webp"] }
-image_hasher = "2.0"
-
-# PDF rendering
-pdfium-render = { version = "0.8", features = ["thread_safe"] }
-
-# Vector index — 纯 Rust HNSW，支持增量插入
-hnsw_rs  = "0.3"
-bincode  = "1"
-
-# Database
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono", "migrate"] }
-
-# File watching
-notify = { version = "6.1", features = ["serde"] }
-
-# Parallel processing
-rayon              = "1.10"
-crossbeam-channel  = "0.5"
-parking_lot        = "0.12"
-num_cpus           = "1"
-
-# Serialization / logging / errors
-serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-toml               = "0.8"
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
-anyhow             = "1"
-thiserror          = "2"
-
-# 其他工具类：uuid / chrono / walkdir / base64 / hex / bytes / mime / once_cell / tempfile
-```
-
----
-
-## 关键性能改进回顾（相对旧版本）
-
-| 方面 | 旧实现 | 新实现 | 收益 |
-|------|--------|--------|------|
-| 向量索引 | `instant-distance` 全量重建 | `hnsw_rs` 增量 insert | 每秒吞吐 +N 倍，消除 2GB 级内存副本 |
-| 删除 | 重建触发 | 墓碑 + over-fetch 过滤 | 删除 O(1)，不影响后续写入 |
-| CLIP 并发 | `Arc<Mutex<Session>>` 全局串行 | 每 worker 独立 Session | 8 worker ≈ 8 倍吞吐 |
-| 单文件 CLIP | 每页单独 forward | 批量一次 forward | 多页文件 +40% 吞吐 |
-| 页行写入 | 每页 1 个 INSERT | 整文件 1 个事务 | 30 页文件 fsync 30→1 |
-| 缩略图 | JPEG q=90 | 无损 WebP | 设计稿 ~30% 体积缩减，零有损伪影 |
-| ort 版本 | `"2.0.0-rc.12"` 浮动 | `"=2.0.0-rc.12"` 精确 | 防止 RC 迭代期 API 漂移 |
-| CLIP 模型 | FP32 350MB | FP32 或可选 **INT8 ~90MB** | 量化后推理 2-3× 加速 |
-| 结果排序 | 单一 `clip + 0.05·phash_bonus` | `FusionWeights` 三信号归一化加权 | 显式可解释、可调，重复 crop 更准 |
+> 规模随每文件页数线性变化；上表按实测约 0.8 页/文件估算。128GB 内存下即使
+> 升 ViT-B/14（768d，向量翻倍）或加 tile 金字塔 L2 层也毫无压力。
 
 ---
 
 ## 部署说明
 
 ### 所需文件
-1. `oxide_seeker.exe`（编译产物）
+1. `oxide_seeker.exe` + `oxide_seeker_service.exe`（可选服务包装）
 2. `config.toml`
-3. `models/clip_visual.onnx`（FP32 或 INT8）
-4. `onnxruntime.dll`
-5. `pdfium.dll`
+3. `dinov2_vits14_int8.onnx`（视觉，由 `scripts/export_dinov2.py` 导出）
+4. `ppocr_det.onnx` + `ppocr_rec.onnx`（OCR，从 RapidOCR 拷贝；缺失则纯视觉降级）
+5. `onnxruntime.dll`、`pdfium.dll`
 
-### 首次运行
-```bash
-oxide_seeker.exe --config config.toml
-# 访问 http://server-ip:7788
-```
+> ⚠️ `onnxruntime.dll` 必须在 exe 旁边——否则 Windows 可能加载 System32 里的
+> 旧版导致进程在 ort 版本握手时挂死。
 
-### 注册为 Windows 服务（可选）
-```bash
-sc create OxideSeeker binPath="C:\OxideSeeker\oxide_seeker.exe --config C:\OxideSeeker\config.toml"
-sc start OxideSeeker
-```
+### 从 v1 升级
+1. **先用旧版 exe 跑基线评测留档**（旧库上 `--evaluate --label clip-baseline`）
+2. 停服务，**删除整个 data 目录**（v1 库不兼容）
+3. 替换 exe 与模型文件，更新 config.toml（`grid_size`→`tiles_enabled`、`model_path`、OCR 路径、融合权重）
+4. 启动，全量索引自动开始（后台数小时，INT8 减半以上）
+5. 索引完成后 OCR 回填自动跑（后台独立，看 `/api/index/status` 的 `ocr_pending`）
+6. `ocr_pending` 归零后 `--evaluate --label final` 跑分对比基线
 
 ---
 
-## 实现优先级（历史）
+## 后续路线（按评测结果决定）
 
-| 阶段 | 功能 | 状态 |
-|------|------|------|
-| P0 | 项目骨架 + 配置加载 + SQLite 初始化 | ✅ |
-| P0 | PDF 渲染 + pHash 索引 + 基础搜索 | ✅ |
-| P1 | CLIP 模型推理 + 向量索引 | ✅ |
-| P1 | Web 服务 + 搜索 API + 前端 UI | ✅ |
-| P2 | 拼版 PDF 过滤器（XMP） | ✅ |
-| P2 | 文件监控（增量更新） | ✅ |
-| P3 | WebSocket 进度推送 | ✅ |
-| P3 | AI 文件（.ai）支持 | ✅ |
-| P4 | **hnsw_rs 增量索引** | ✅ |
-| P4 | **多 Session CLIP 并发** | ✅ |
-| P4 | **批量 SQLite 事务** | ✅ |
-| P4 | **多信号融合重排** | ✅ |
-| P4 | **WebP 缩略图** | ✅ |
-| P4 | **INT8 量化支持（文档 + 透明加载）** | ✅ |
-| P5 | 文本编码器（"文搜图"） | 未完成（需加载 text_model.onnx + tokenizers） |
-| P5 | 墓碑压缩（大量删除后重建） | 未完成（当前需手动删除 dump 后重建） |
+已完成的四阶段（评测框架 → DINOv2+schema → 搜索管线 → OCR 通道）见
+`REFACTOR_PLAN.md` / `OCR_PLAN.md`。剩余候选：
+
+| 候选 | 触发条件 | 说明 |
+|------|----------|------|
+| 真实查询埋点回归 | 上线积累样本后 | 记录用户点击的正确结果，替换合成评测集做黄金回归；也是判断 large 桶回落是否真实的唯一可靠方式 |
+| 密集 pHash 网格精排 | 局部小截图（<页面 1/10）召回不足 | 每页预存多尺度滑窗 pHash，对 ANN top-200 精排，成本≈0 |
+| AKAZE+RANSAC 几何验证 | 需要"精确模式" | top-30 关键点校验，+300-500ms，near-dup 指哪打哪 |
+| DINOv2 ViT-B/14 | ViT-S 区分度不足 | 768 维，~3× 索引时间，零代码改动（维度自动探测） |
+| tile 金字塔 L2 | 极小目标召回不足 | +25 tile/页（尺寸⅓步长⅙），内存可承受 |

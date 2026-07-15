@@ -10,16 +10,23 @@ rescan_interval_secs = 1800   # 0 关闭定时重扫
 watcher_settle_secs  = 3      # 稳定性采样间隔
 watcher_min_bytes    = 1024   # 小于此值视为占位文件
 watcher_max_retries  = 20     # 不稳定文件最多等 60s
+tiles_enabled        = true   # 每页额外索引 9 个 50% 重叠 tile（尺寸=½页,步长=¼页）,提升局部截图召回
 
 [paths]
 data_dir = "./data"
-model_path = "./clip_visual.onnx"
+model_path = "./dinov2_vits14_int8.onnx"   # 评测采用 INT8(编码减半,Recall 掉点<2pp);FP32 版为 dinov2_vits14.onnx
+ocr_det_path = "./ppocr_det.onnx"     # PP-OCR 检测模型;缺失则文本通道禁用(纯视觉搜索)
+ocr_rec_path = "./ppocr_rec.onnx"     # PP-OCR 识别模型(字典内嵌)
 scan_dirs = []
 
 [search]
 default_top_k = 20
 phash_threshold = 12
-similarity_threshold = 0.65
+similarity_threshold = 0.30   # 宽松噪声下限;标定显示命中/噪声视觉分布重叠,排序交给三信号融合
+query_center_crop = false     # 评测证实:关闭更快且更准(双向量污染候选合并)
+weight_vector = 0.70          # 融合权重(2026-07 标定);视觉为主
+weight_phash  = 0.10          # 近重复辨识
+weight_text   = 0.20          # OCR 文本;同版式区分主力,large 桶偏弱可降到 0.15
 
 [server]
 host = "0.0.0.0"

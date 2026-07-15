@@ -26,8 +26,25 @@ pub struct PathsConfig {
     pub scan_dirs: Vec<PathBuf>,
     /// Root directory for database, thumbnails, and vector index
     pub data_dir: PathBuf,
-    /// Path to the CLIP visual encoder ONNX model file
+    /// Path to the vision encoder ONNX model file
     pub model_path: PathBuf,
+    /// PP-OCR detector model.  If the file is missing the OCR text channel
+    /// is disabled (visual-only search) with a startup warning.
+    #[serde(default = "PathsConfig::default_ocr_det_path")]
+    pub ocr_det_path: PathBuf,
+    /// PP-OCR recognizer model (vocabulary embedded in its metadata).
+    #[serde(default = "PathsConfig::default_ocr_rec_path")]
+    pub ocr_rec_path: PathBuf,
+}
+
+impl PathsConfig {
+    fn default_ocr_det_path() -> PathBuf {
+        PathBuf::from("./ppocr_det.onnx")
+    }
+
+    fn default_ocr_rec_path() -> PathBuf {
+        PathBuf::from("./ppocr_rec.onnx")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -70,6 +87,13 @@ pub struct IndexerConfig {
     /// `watcher_settle_secs=3` this gives a one-minute settling window.
     #[serde(default = "IndexerConfig::default_watcher_max_retries")]
     pub watcher_max_retries: u32,
+    /// When `true` (default), each page is indexed as the full-page embedding
+    /// **plus 9 overlapping tiles** (tile edge = ½ page, stride = ¼ page), so
+    /// a query that only matches part of the artwork can still recall the
+    /// page.  Costs 10× the embeddings per page; disable only for very large
+    /// corpora where partial-screenshot queries don't matter.
+    #[serde(default = "IndexerConfig::default_tiles_enabled")]
+    pub tiles_enabled: bool,
 }
 
 /// Hard cap for `IndexerConfig::max_scan_depth`.  Picked at 32 because:
@@ -101,6 +125,10 @@ impl IndexerConfig {
         20
     }
 
+    fn default_tiles_enabled() -> bool {
+        true
+    }
+
     /// Return the configured depth, clamped to [`MAX_SCAN_DEPTH_LIMIT`].
     /// A depth of `0` means "scan the root directory only", so we keep the
     /// raw value as-is at the lower bound.
@@ -117,6 +145,44 @@ pub struct SearchConfig {
     pub similarity_threshold: f32,
     /// Maximum pHash Hamming distance (0–64, lower = stricter)
     pub phash_threshold: u32,
+    /// When `true`, the query image is encoded at two scales (whole frame +
+    /// centre 70 % crop) and the ANN hits are merged — a recall aid for
+    /// screenshots with large blank margins, at the cost of doubling encoder
+    /// time (the dominant latency stage).  Toggle and compare with
+    /// `--evaluate` on the same seed to decide whether the second pass pays
+    /// for itself on your corpus.
+    #[serde(default = "SearchConfig::default_query_center_crop")]
+    pub query_center_crop: bool,
+    /// Fusion weight on embedding cosine similarity.  The three weights are
+    /// re-tunable per corpus via `--evaluate`; the defaults come from the
+    /// 2026-07 calibration run (visual dominates, text breaks same-layout
+    /// ties, pHash breaks near-duplicate ties).
+    #[serde(default = "SearchConfig::default_weight_vector")]
+    pub weight_vector: f32,
+    /// Fusion weight on pHash proximity.
+    #[serde(default = "SearchConfig::default_weight_phash")]
+    pub weight_phash: f32,
+    /// Fusion weight on the OCR/FTS text score.
+    #[serde(default = "SearchConfig::default_weight_text")]
+    pub weight_text: f32,
+}
+
+impl SearchConfig {
+    fn default_query_center_crop() -> bool {
+        true
+    }
+
+    fn default_weight_vector() -> f32 {
+        0.70
+    }
+
+    fn default_weight_phash() -> f32 {
+        0.10
+    }
+
+    fn default_weight_text() -> f32 {
+        0.20
+    }
 }
 
 /// Filter configuration is intentionally empty — the sole exclusion
@@ -165,9 +231,9 @@ impl Config {
         self.paths.data_dir.join("index.db")
     }
 
-    /// Resolved path to the usearch vector index file.
+    /// Resolved base path for the HNSW vector index dump files.
     pub fn vector_index_path(&self) -> PathBuf {
-        self.paths.data_dir.join("vectors.usearch")
+        self.paths.data_dir.join("vectors.hnsw")
     }
 
     /// Resolved path to the thumbnails directory.
@@ -187,7 +253,9 @@ impl Default for Config {
             paths: PathsConfig {
                 scan_dirs: vec![],
                 data_dir: PathBuf::from("data"),
-                model_path: PathBuf::from("models/clip_visual.onnx"),
+                model_path: PathBuf::from("models/dinov2_vits14.onnx"),
+                ocr_det_path: PathsConfig::default_ocr_det_path(),
+                ocr_rec_path: PathsConfig::default_ocr_rec_path(),
             },
             indexer: IndexerConfig {
                 worker_threads,
@@ -199,11 +267,19 @@ impl Default for Config {
                 watcher_settle_secs: IndexerConfig::default_watcher_settle_secs(),
                 watcher_min_bytes: IndexerConfig::default_watcher_min_bytes(),
                 watcher_max_retries: IndexerConfig::default_watcher_max_retries(),
+                tiles_enabled: IndexerConfig::default_tiles_enabled(),
             },
             search: SearchConfig {
                 default_top_k: 20,
-                similarity_threshold: 0.65,
+                // DINOv2 similarity distribution is much wider than CLIP's —
+                // a lenient floor only trims obvious noise; ranking does the
+                // real work.  Re-calibrate with `--evaluate` after indexing.
+                similarity_threshold: 0.30,
                 phash_threshold: 12,
+                query_center_crop: SearchConfig::default_query_center_crop(),
+                weight_vector: SearchConfig::default_weight_vector(),
+                weight_phash: SearchConfig::default_weight_phash(),
+                weight_text: SearchConfig::default_weight_text(),
             },
             filter: FilterConfig::default(),
         }

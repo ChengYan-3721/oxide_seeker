@@ -30,10 +30,6 @@ pub enum AppError {
     #[error("Vector index error: {0}")]
     VectorIndex(String),
 
-    // ── Search ───────────────────────────────────────────────────────────────
-    #[error("Search error: {0}")]
-    Search(String),
-
     // ── Configuration ────────────────────────────────────────────────────────
     #[error("Configuration error: {0}")]
     Config(String),

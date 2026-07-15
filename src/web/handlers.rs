@@ -1,11 +1,11 @@
 //! Axum HTTP request handlers.
 
 use crate::{
-   embedder::clip::ClipEmbedder,
+   embedder::vision::VisionEmbedder,
    error::{AppError, Result},
    indexer::{self, IndexProgress},
    license,
-   search::{vector_index::VectorIndex, SearchEngine, SearchResponse},
+   search::{vector_index::VectorIndex, PhashStore, SearchEngine, SearchResponse},
    storage::{
        database::{self, DbPool},
        thumbnail::ThumbnailStore,
@@ -21,8 +21,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::path::PathBuf;
 
-/// Maximum upload size: 20 MB
-const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+/// Maximum upload size (bytes).  Beyond this the request is rejected with a
+/// clear 413 rather than being read into memory.  64 MB covers high-quality
+/// PNG screenshots and phone photos; resolution (not byte size) is bounded
+/// separately in `search_bytes`, which also downscales before the pipeline.
+pub const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 // ── Shared handler state ──────────────────────────────────────────────────────
 
@@ -33,8 +36,9 @@ pub struct AppState {
     pub pool: DbPool,
     pub progress: Arc<IndexProgress>,
     pub config_path: PathBuf,
-    pub clip: Arc<ClipEmbedder>,
+    pub embedder: Arc<VisionEmbedder>,
     pub vector_index: Arc<VectorIndex>,
+    pub phash_store: Arc<PhashStore>,
     pub thumb_store: Arc<ThumbnailStore>,
 }
 
@@ -147,10 +151,15 @@ pub struct IndexStatusResponse {
     pub failed_files: i64,
     pub total_pages: i64,
     pub progress_percent: f64,
+    /// Pages whose OCR text has been extracted (text channel coverage).
+    pub ocr_done: i64,
+    /// Pages still awaiting the background OCR backfill.
+    pub ocr_pending: i64,
 }
 
 pub async fn index_status(State(state): State<AppState>) -> Result<Json<IndexStatusResponse>> {
     let stats = database::get_index_stats(&state.pool).await?;
+    let (ocr_done, ocr_pending) = database::ocr_progress(&state.pool).await?;
     
     // Use memory counters for live progress, as they are the source of truth for the current batch
     let processed = state.progress.processed.load(std::sync::atomic::Ordering::Relaxed);
@@ -182,6 +191,8 @@ pub async fn index_status(State(state): State<AppState>) -> Result<Json<IndexSta
         failed_files: stats.failed_files,
         total_pages: stats.total_pages,
         progress_percent,
+        ocr_done,
+        ocr_pending,
     }))
 }
 
@@ -364,6 +375,7 @@ pub async fn update_config(
 
     let pool = state.pool.clone();
     let vector_index = state.vector_index.clone();
+    let phash_store = state.phash_store.clone();
     let progress = state.progress.clone();
 
     tokio::spawn(async move {
@@ -371,6 +383,7 @@ pub async fn update_config(
             config_arc,
             pool,
             vector_index,
+            phash_store,
             progress,
         ).await {
             tracing::error!("Failed to trigger re-index after config update: {}", e);

@@ -1,6 +1,6 @@
 [package]
 name = "oxide_seeker"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 
 [[bin]]
@@ -26,6 +26,8 @@ ndarray = "0.15"
 # Image processing — `webp` feature enables both decoding and lossless encoding.
 image = { version = "0.25", features = ["jpeg", "png", "webp"] }
 image_hasher = "2.0"
+# Connected components + morphology for the OCR detector's DBNet post-processing.
+imageproc = "0.25"
 
 # PDF rendering
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
@@ -44,6 +46,9 @@ notify = { version = "6.1", features = ["serde"] }
 
 # Parallel processing
 rayon = "1.10"
+
+# Synthetic-query generation for the offline evaluation harness (--evaluate)
+rand = "0.8"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

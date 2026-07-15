@@ -10,7 +10,7 @@ use crate::{
     config::Config,
     error::Result,
     indexer::{scanner, worker_pool},
-    search::vector_index::VectorIndex,
+    search::{phash_store::PhashStore, vector_index::VectorIndex},
     storage::database::DbPool,
 };
 use notify::{
@@ -56,6 +56,7 @@ pub async fn start_watcher(
     config: Arc<Config>,
     pool: DbPool,
     index: Arc<VectorIndex>,
+    phash_store: Arc<PhashStore>,
 ) -> Result<RecommendedWatcher> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
     let (del_tx, mut del_rx) = mpsc::unbounded_channel::<PathBuf>();
@@ -68,6 +69,7 @@ pub async fn start_watcher(
     let config_clone = config.clone();
     let pool_clone = pool.clone();
     let index_clone = index.clone();
+    let phash_clone = phash_store.clone();
 
     tokio::spawn(async move {
         let mut pending: HashMap<PathBuf, PendingState> = HashMap::new();
@@ -97,11 +99,11 @@ pub async fn start_watcher(
                             match crate::storage::database::delete_file_by_path(
                                 &pool_clone, &path_str,
                             ).await {
-                                Ok(vector_ids) => {
-                                    if !vector_ids.is_empty() {
-                                        let vids: Vec<u64> = vector_ids
-                                            .into_iter()
-                                            .map(|v| v as u64)
+                                Ok(region_ids) => {
+                                    if !region_ids.is_empty() {
+                                        let vids: Vec<u64> = region_ids
+                                            .iter()
+                                            .map(|v| *v as u64)
                                             .collect();
                                         if let Err(e) = index_clone.remove(&vids) {
                                             tracing::warn!(
@@ -109,6 +111,7 @@ pub async fn start_watcher(
                                                 path_str, e
                                             );
                                         }
+                                        phash_clone.remove(&region_ids);
                                     }
                                     tracing::info!("Removed from index: {}", path_str);
                                 }
@@ -123,7 +126,6 @@ pub async fn start_watcher(
                         if let Err(e) = index_clone.save() {
                             tracing::warn!("Failed to save vector index after deletions: {}", e);
                         }
-                        index_clone.trigger_rebuild();
                     }
 
                     if pending.is_empty() {
@@ -301,10 +303,11 @@ pub async fn start_watcher(
                     let cfg = config_clone.clone();
                     let p = pool_clone.clone();
                     let i = index_clone.clone();
+                    let ph = phash_clone.clone();
                     let progress = worker_pool::IndexProgress::new(to_dispatch.len() as u64);
 
                     tokio::task::spawn_blocking(move || {
-                        worker_pool::run_batch(to_dispatch, p, i, cfg, progress);
+                        worker_pool::run_batch(to_dispatch, p, i, ph, cfg, progress);
                     });
                 }
             }

@@ -2,26 +2,32 @@
 //!
 //! Design highlights
 //! -----------------
+//! * **Vector ids come from SQLite.**  `regions.id` doubles as the HNSW id,
+//!   so there is no separate id allocator; the DB row and its ANN entry can
+//!   never drift apart.
+//! * **The graph is a rebuildable cache.**  Every embedding is persisted in
+//!   `regions.vector`, so a missing/corrupt dump is repaired by streaming the
+//!   blobs back through `add_batch` (~20 min for 6 M vectors) instead of
+//!   re-running model inference (~a day).  See `search::rebuild_if_needed`.
 //! * **True incremental insertion.**  `Hnsw::insert` is O(log N); we never
 //!   rebuild the graph on `add`.  Searches see newly-inserted vectors
-//!   immediately — no `trigger_rebuild` / background snapshot dance.
-//! * **Zero duplicate storage.**  hnsw_rs owns every vector inside its graph
-//!   (`PointData::V(Vec<T>)`).  We do **not** keep a secondary `entries` copy,
-//!   which previously doubled RAM usage at ~1 GB per million 512-dim vectors.
+//!   immediately.
 //! * **Tombstone-based deletion.**  hnsw_rs does not support in-place removal,
 //!   so `remove` adds ids to a `HashSet`.  Searches over-fetch and filter
-//!   deleted ids at query time.  Tombstone growth is bounded in practice
-//!   (users delete files occasionally, not en masse).
-//! * **Pre-normalised dot distance.**  `ClipEmbedder` L2-normalises every
+//!   deleted ids at query time.  After mass deletions, delete the dump files
+//!   and let the startup rebuild path compact the graph from the DB.
+//! * **Pre-normalised dot distance.**  The embedder L2-normalises every
 //!   vector, so we use `DistDot` (= 1 − cosine-similarity for unit vectors),
 //!   which skips the redundant norm calculation inside cosine distance.
 //! * **Persistence** uses hnsw_rs's native `file_dump` / `HnswIo::load_hnsw`,
 //!   producing `{basename}.hnsw.graph` + `{basename}.hnsw.data`.  A small
-//!   sidecar `{basename}.meta.bin` records `next_id` and the tombstone set.
+//!   sidecar `{basename}.meta.bin` records the tombstone set.
 //!
-//! Hyperparameters (tuned for 512-dim CLIP embeddings, ~200k-1M vectors):
-//! `M=16`, `ef_construction=200`, `ef_search=64`.  Increase `ef_search`
-//! (via over-fetching) when many tombstones are present.
+//! Hyperparameters (tuned for 384-dim DINOv2 embeddings, ~500k-10M vectors):
+//! `M=16`, `ef_construction=200`, `ef_search=256`.  The relatively high
+//! ef_search keeps recall healthy at the multi-million-vector scale that
+//! overlapping tiles produce; at ~50 ms per query it is still far below the
+//! encoder's share of the latency budget.
 
 use crate::error::{AppError, Result};
 use hnsw_rs::{api::AnnT, hnsw::Hnsw, hnswio::HnswIo, prelude::DistDot};
@@ -30,13 +36,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
-/// A vector id is the integer stored in `pages.vector_id`.
+/// A vector id is the `regions.id` of the embedded region.
 pub type VectorId = u64;
 
 /// Top-K search result.
@@ -65,7 +68,7 @@ const MAX_LAYER: usize = 16;
 /// Allocation hint — grows automatically beyond this.
 const DEFAULT_CAPACITY: usize = 500_000;
 /// ef during search (higher = more accurate, slower).
-const EF_SEARCH: usize = 64;
+const EF_SEARCH: usize = 256;
 
 // ── File naming ──────────────────────────────────────────────────────────────
 
@@ -76,7 +79,6 @@ const META_SUFFIX: &str = ".meta.bin";
 /// Sidecar metadata persisted alongside the HNSW graph.
 #[derive(Serialize, Deserialize, Default)]
 struct VectorMeta {
-    next_id: u64,
     deleted: Vec<u64>,
 }
 
@@ -88,8 +90,13 @@ pub struct VectorIndex {
     /// Tombstone set — ids that have been logically removed but may still
     /// appear in graph traversals.  Filtered out at search time.
     deleted: RwLock<HashSet<VectorId>>,
-    /// Next allocatable id (strictly monotonic across the lifetime of the DB).
-    next_id: AtomicU64,
+    /// Serialises [`save`](Self::save).  The dump-to-tmp-then-rename dance is
+    /// NOT safe to run concurrently: the periodic-rescan and watcher-deletion
+    /// paths both call save, and two interleaved saves race on the same tmp
+    /// files — one renames them away and the other dies with "file not
+    /// found" / "access denied" (868 such log entries in the first
+    /// production run).
+    save_lock: parking_lot::Mutex<()>,
     /// Directory containing the dump files.
     dir: PathBuf,
     /// Base filename without extension (e.g. `"vectors"`).
@@ -101,7 +108,7 @@ impl VectorIndex {
     ///
     /// The parent directory of `path_base` is used as the storage dir; its
     /// file stem is used as the basename.  For example,
-    /// `data/vectors.usearch` → dir=`data/`, basename=`vectors`.
+    /// `data/vectors.hnsw` → dir=`data/`, basename=`vectors`.
     pub fn open(path_base: &Path) -> Result<Arc<Self>> {
         let dir = path_base
             .parent()
@@ -136,10 +143,9 @@ impl VectorIndex {
                         .and_then(|bytes| bincode::deserialize(&bytes).ok())
                         .unwrap_or_default();
                     tracing::info!(
-                        "HNSW loaded: {} points, {} tombstones, next_id={}",
+                        "HNSW loaded: {} points, {} tombstones",
                         hnsw.get_nb_point(),
                         meta.deleted.len(),
-                        meta.next_id,
                     );
                     (hnsw, meta)
                 }
@@ -165,38 +171,33 @@ impl VectorIndex {
                     }
 
                     tracing::info!("Creating fresh HNSW index at {}", dir.display());
-                    let hnsw = Hnsw::<f32, DistDot>::new(
-                        MAX_NB_CONNECTION,
-                        DEFAULT_CAPACITY,
-                        MAX_LAYER,
-                        EF_CONSTRUCTION,
-                        DistDot {},
-                    );
-                    (hnsw, VectorMeta { next_id: 1, deleted: vec![] })
+                    (Self::fresh_graph(), VectorMeta::default())
                 }
             }
         } else {
             tracing::info!("Creating fresh HNSW index at {}", dir.display());
-            let hnsw = Hnsw::<f32, DistDot>::new(
-                MAX_NB_CONNECTION,
-                DEFAULT_CAPACITY,
-                MAX_LAYER,
-                EF_CONSTRUCTION,
-                DistDot {},
-            );
-            (hnsw, VectorMeta { next_id: 1, deleted: vec![] })
+            (Self::fresh_graph(), VectorMeta::default())
         };
 
         let deleted: HashSet<VectorId> = meta.deleted.iter().copied().collect();
-        let next = meta.next_id.max(1);
 
         Ok(Arc::new(Self {
             hnsw,
             deleted: RwLock::new(deleted),
-            next_id: AtomicU64::new(next),
+            save_lock: parking_lot::Mutex::new(()),
             dir,
             basename,
         }))
+    }
+
+    fn fresh_graph() -> Hnsw<'static, f32, DistDot> {
+        Hnsw::<f32, DistDot>::new(
+            MAX_NB_CONNECTION,
+            DEFAULT_CAPACITY,
+            MAX_LAYER,
+            EF_CONSTRUCTION,
+            DistDot {},
+        )
     }
 
     /// Add a single vector with the given `id`.  Searchable immediately.
@@ -229,9 +230,9 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Mark vector ids as deleted.  Does not reclaim graph memory; repeated
-    /// mass-deletion should be followed by a cold rebuild (delete the dump
-    /// files and re-index) to compact the graph.
+    /// Mark vector ids as deleted.  Does not reclaim graph memory; after
+    /// mass deletions delete the dump files and let the startup rebuild
+    /// path compact the graph from the DB.
     pub fn remove(&self, ids: &[VectorId]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -289,10 +290,15 @@ impl VectorIndex {
     /// updating the canonical ones.  We dump to a temp basename and rename on
     /// success so the canonical pair always reflects the latest state.
     pub fn save(&self) -> Result<()> {
+        // One save at a time — see `save_lock`.  Concurrent callers just
+        // queue up; a save that follows immediately re-dumps the newer state,
+        // which is cheap next to the corruption risk it prevents.
+        let _guard = self.save_lock.lock();
+
         std::fs::create_dir_all(&self.dir).map_err(AppError::Io)?;
 
         // hnsw_rs panics / errors when dumping an HNSW with no entry point.
-        // Persist meta only so `next_id` survives restarts in this case.
+        // Persist meta only in this case.
         if self.hnsw.get_nb_point() == 0 {
             self.write_meta()?;
             return Ok(());
@@ -350,7 +356,6 @@ impl VectorIndex {
 
     fn write_meta(&self) -> Result<()> {
         let meta = VectorMeta {
-            next_id: self.next_id.load(Ordering::Acquire),
             deleted: self.deleted.read().iter().copied().collect(),
         };
         let bytes = bincode::serialize(&meta)
@@ -360,13 +365,7 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Allocate a fresh, unique vector id.
-    pub fn next_id(&self) -> VectorId {
-        self.next_id.fetch_add(1, Ordering::AcqRel)
-    }
-
     /// Number of live (non-tombstoned) vectors.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.hnsw
             .get_nb_point()
@@ -376,22 +375,5 @@ impl VectorIndex {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Always `true` — hnsw_rs is query-ready after every insert; there is
-    /// no background rebuild stage.  Kept for API compatibility.
-    #[allow(dead_code)]
-    pub fn is_ready(&self) -> bool {
-        true
-    }
-
-    /// No-op — kept for API compatibility with the previous rebuild-based
-    /// implementation.
-    pub fn trigger_rebuild(self: &Arc<Self>) {}
-
-    /// No-op — inserts go straight into the live graph.
-    #[allow(dead_code)]
-    pub fn rebuild_sync(&self) -> Result<()> {
-        Ok(())
     }
 }
